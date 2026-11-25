@@ -1,0 +1,860 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7e4ed99002..4f0b2207bb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,7 +29,7 @@ resolver = "3"
+ [workspace.package]
+ version = "19.1.1"
+ edition = "2024"
+-rust-version = "1.101"
++rust-version = "1.100"
+ license = "MIT"
+ authors = ["Stencil Labs, Inc."]
+ homepage = "https://omp.sh/"
+diff --git a/crates/builtins/src/lib.rs b/crates/builtins/src/lib.rs
+index e6bbc40a5b..4b6e5e20b3 100644
+--- a/crates/builtins/src/lib.rs
++++ b/crates/builtins/src/lib.rs
+@@ -281,6 +281,6 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
+ /// implementation.
+ #[cfg(all(
+ 	feature = "util.procs",
+-	any(target_os = "linux", target_os = "macos", target_os = "windows")
++	any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows")
+ ))]
+ pub use proc_snapshot::sys as proc_sys;
+diff --git a/crates/builtins/src/pkill.rs b/crates/builtins/src/pkill.rs
+index cb12deee5c..a7abe3ecd4 100644
+--- a/crates/builtins/src/pkill.rs
++++ b/crates/builtins/src/pkill.rs
+@@ -64,4 +64,7 @@ mod tests {
+ 		assert_eq!(signal_number("NOPE"), None);
+ 		assert_eq!(signal_number("-1"), None);
+ 	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	mod realtime_signal_tests;
+ }
+diff --git a/crates/builtins/src/pkill/tests/realtime_signal_tests.rs b/crates/builtins/src/pkill/tests/realtime_signal_tests.rs
+new file mode 100644
+index 0000000000..8c65df275d
+--- /dev/null
++++ b/crates/builtins/src/pkill/tests/realtime_signal_tests.rs
+@@ -0,0 +1,10 @@
++use super::run;
++
++#[tokio::test]
++async fn realtime_signal_bounds_reach_the_builtin_without_signalling() {
++	let max = libc::SIGRTMAX();
++	let max_arg = format!("-{max}");
++	let past_max_arg = format!("-{}", max + 1);
++	assert_eq!(run(&[&max_arg]).await, 1);
++	assert_eq!(run(&[&past_max_arg]).await, 2);
++}
+diff --git a/crates/builtins/src/proc_snapshot.rs b/crates/builtins/src/proc_snapshot.rs
+index 7bbe5a2628..c60744a4a8 100644
+--- a/crates/builtins/src/proc_snapshot.rs
++++ b/crates/builtins/src/proc_snapshot.rs
+@@ -116,7 +116,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
+ }
+ 
+ /// Linux process primitives: procfs and pidfds.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "android", target_os = "linux"))]
+ pub mod sys {
+ 	use std::{
+ 		fs,
+@@ -197,7 +197,7 @@ pub mod sys {
+ 	}
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "android", target_os = "linux"))]
+ mod proc_snapshot {
+ 	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
+ 
+@@ -364,6 +364,21 @@ mod proc_snapshot {
+ 				return alive();
+ 			}
+ 			let Some(pidfd) = sys::open_pidfd(self.pid) else {
++				#[cfg(target_os = "android")]
++				{
++					if queue.is_some() {
++						return false;
++					}
++					let Some(stat) = read_stat(self.pid) else {
++						return false;
++					};
++					if stat.start_time != self.stat.start_time || stat.state == 'Z' {
++						return false;
++					}
++					// SAFETY: kill takes scalar arguments and no pointers.
++					return unsafe { libc::kill(self.pid, signal) == 0 };
++				}
++				#[cfg(target_os = "linux")]
+ 				return false;
+ 			};
+ 			if !alive() {
+@@ -490,6 +505,7 @@ mod proc_snapshot {
+ 		Some((ids.next()?, ids.next()?))
+ 	}
+ 
++	#[cfg(target_os = "linux")]
+ 	fn uptime_seconds() -> Option<f64> {
+ 		fs::read_to_string("/proc/uptime")
+ 			.ok()?
+@@ -499,6 +515,19 @@ mod proc_snapshot {
+ 			.ok()
+ 	}
+ 
++	#[cfg(target_os = "android")]
++	fn uptime_seconds() -> Option<f64> {
++		let mut uptime = libc::timespec {
++			tv_sec:  0,
++			tv_nsec: 0,
++		};
++		// SAFETY: clock_gettime writes one initialized timespec to a valid pointer.
++		if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut uptime) } != 0 {
++			return None;
++		}
++		Some(uptime.tv_sec as f64 + uptime.tv_nsec as f64 / 1_000_000_000.0)
++	}
++
+ 	fn clock_ticks() -> Option<u64> {
+ 		// SAFETY: sysconf reads a process-global constant.
+ 		u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+@@ -1876,7 +1905,7 @@ mod proc_snapshot {
+ 	}
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+ 
+ /// The processes a signal must never reach: this one and its ancestors.
+@@ -1900,7 +1929,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+ ///
+ /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
+ /// them. Only signalling consults this.
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ pub struct HostProcesses {
+ 	/// This process and its ancestors, nearest first.
+ 	pub pids:  smallvec::SmallVec<[i32; 16]>,
+@@ -1913,17 +1942,17 @@ pub struct HostProcesses {
+ /// Keeping the walk over this rather than over [`ProcInfo`] lets the recycling
+ /// cases — which are otherwise only reachable by winning a race against the OS —
+ /// be tested with a synthetic tree.
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ #[derive(Clone, Copy)]
+ struct ChainNode {
+ 	ppid:  Option<i32>,
+ 	pgid:  Option<i32>,
+-	/// Platform start time. Monotonic on all three supported platforms, so a
+-	/// larger value means the process started later.
++	/// Platform start time. Monotonic on every supported platform, so a larger
++	/// value means the process started later.
+ 	start: u64,
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ impl HostProcesses {
+ 	/// Whether signalling `target` would reach this process or one of its
+ 	/// ancestors.
+diff --git a/crates/builtins/src/ps.rs b/crates/builtins/src/ps.rs
+index 8ea2936005..1ab61a75c5 100644
+--- a/crates/builtins/src/ps.rs
++++ b/crates/builtins/src/ps.rs
+@@ -1281,7 +1281,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
+ 	}
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "android", target_os = "linux"))]
+ fn ps_total_memory_bytes() -> Option<u64> {
+ 	let value = fs::read_to_string("/proc/meminfo")
+ 		.ok()?
+diff --git a/crates/builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
+index d28e8c0672..d726f0a08f 100644
+--- a/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
++++ b/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
+@@ -40,7 +40,9 @@ pub(super) fn gai_text(code: i32) -> String {
+ 		return format!("Unknown error {code}");
+ 	}
+ 	// SAFETY: non-null, NUL-terminated, static.
+-	unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
++	unsafe { CStr::from_ptr(text) }
++		.to_string_lossy()
++		.into_owned()
+ }
+ 
+ /// Address family for `-4`/`-6`.
+@@ -75,7 +77,10 @@ pub(super) fn resolve(
+ 	passive: bool,
+ ) -> Result<Vec<Addr>, i32> {
+ 	let host = host.map(CString::new).transpose().map_err(|_| EAI_NONAME)?;
+-	let service = service.map(CString::new).transpose().map_err(|_| EAI_NONAME)?;
++	let service = service
++		.map(CString::new)
++		.transpose()
++		.map_err(|_| EAI_NONAME)?;
+ 	// SAFETY: an all-zero addrinfo is a valid "no hints" value.
+ 	let mut hints: libc::addrinfo = unsafe { zeroed() };
+ 	hints.ai_family = family;
+@@ -139,7 +144,7 @@ pub(super) fn numeric_host(addr: &Addr) -> String {
+ 			addr.as_ptr(),
+ 			addr.len,
+ 			buf.as_mut_ptr(),
+-			buf.len() as libc::socklen_t,
++			buf.len() as _,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NUMERICHOST,
+@@ -149,7 +154,9 @@ pub(super) fn numeric_host(addr: &Addr) -> String {
+ 		return format!("*getnameinfo failure: {}*", gai_text(rc));
+ 	}
+ 	// SAFETY: getnameinfo NUL-terminated the buffer on success.
+-	unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
++	unsafe { CStr::from_ptr(buf.as_ptr()) }
++		.to_string_lossy()
++		.into_owned()
+ }
+ 
+ /// A socket being connected.
+@@ -204,7 +211,11 @@ impl Socket {
+ 		if flags < 0 {
+ 			return Err(io::Error::last_os_error());
+ 		}
+-		let flags = if on { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
++		let flags = if on {
++			flags | libc::O_NONBLOCK
++		} else {
++			flags & !libc::O_NONBLOCK
++		};
+ 		// SAFETY: valid fd.
+ 		if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+ 			return Err(io::Error::last_os_error());
+diff --git a/crates/builtins/src/rsync/tree/sys.rs b/crates/builtins/src/rsync/tree/sys.rs
+index e15c133f23..3de49d2c46 100644
+--- a/crates/builtins/src/rsync/tree/sys.rs
++++ b/crates/builtins/src/rsync/tree/sys.rs
+@@ -269,10 +269,17 @@ pub(crate) fn mknodat(
+ 
+ /// `mkfifoat(dir, name, mode)`.
+ pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
+-	check(retry(|| {
+-		// SAFETY: valid C string and dirfd.
+-		unsafe { libc::mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
+-	}))
++	#[cfg(target_os = "android")]
++	{
++		mknodat(dir, name, mode | libc::S_IFIFO, 0)
++	}
++	#[cfg(not(target_os = "android"))]
++	{
++		check(retry(|| {
++			// SAFETY: valid C string and dirfd.
++			unsafe { libc::mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
++		}))
++	}
+ }
+ 
+ /// Names in the directory `fd` (opened for reading), without `.` and `..`.
+diff --git a/crates/natives/Cargo.toml b/crates/natives/Cargo.toml
+index 97f698e06a..7c1e81806a 100644
+--- a/crates/natives/Cargo.toml
++++ b/crates/natives/Cargo.toml
+@@ -18,7 +18,6 @@ workspace = true
+ [dependencies]
+ anyhow.workspace = true
+ async-trait.workspace = true
+-arboard.workspace = true
+ base64.workspace = true
+ fontdue.workspace = true
+ grep-matcher.workspace = true
+@@ -95,6 +94,9 @@ objc2-application-services = { version = "=0.3.2", default-features = true }
+ objc2-core-foundation = "=0.3.2"
+ unicode-bidi = "=0.3.18"
+ 
++[target.'cfg(not(target_os = "android"))'.dependencies]
++arboard.workspace = true
++
+ [target.'cfg(unix)'.dependencies]
+ libc.workspace = true
+ 
+diff --git a/crates/natives/src/desktop/control.rs b/crates/natives/src/desktop/control.rs
+index d49256992f..788bd4192d 100644
+--- a/crates/natives/src/desktop/control.rs
++++ b/crates/natives/src/desktop/control.rs
+@@ -710,6 +710,7 @@ impl ControlLease {
+ 
+ 	fn background(source: &CancellationSource) -> CoreResult<Self> {
+ 		Ok(Self {
++			#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+ 			_escape: None,
+ 			_kernel: KernelOwner::acquire(source.0.agent.clone())?,
+ 			running: AtomicBool::new(false),
+@@ -1296,7 +1297,12 @@ pub(crate) fn grant_for_test(source: &CancellationSource) {
+ 			Err(error) => panic!("test kernel owner: {error:?}"),
+ 		}
+ 	};
+-	let owner = ControlLease { _escape: None, _kernel: kernel, running: AtomicBool::new(false) };
++	let owner = ControlLease {
++		#[cfg(any(target_os = "macos", target_os = "linux", windows))]
++		_escape: None,
++		_kernel: kernel,
++		running: AtomicBool::new(false),
++	};
+ 	*source.0.state.lock() = Some(Arc::new(owner));
+ }
+ 
+diff --git a/crates/natives/src/lib.rs b/crates/natives/src/lib.rs
+index af3a083d5d..45f74d8f85 100644
+--- a/crates/natives/src/lib.rs
++++ b/crates/natives/src/lib.rs
+@@ -30,10 +30,12 @@ pub mod audio;
+ pub mod block;
+ #[cfg(all(target_os = "linux", target_env = "gnu"))]
+ mod bundled_libc;
++#[cfg(not(target_os = "android"))]
+ pub mod clipboard;
+ pub mod console_input;
+ pub mod console_threads;
+ pub mod crash_handler;
++#[cfg(not(target_os = "android"))]
+ pub mod desktop;
+ pub mod devicecheck;
+ pub mod diff;
+diff --git a/crates/shell/src/bash/vm/proc.rs b/crates/shell/src/bash/vm/proc.rs
+index c0c584db8e..018aa7c754 100644
+--- a/crates/shell/src/bash/vm/proc.rs
++++ b/crates/shell/src/bash/vm/proc.rs
+@@ -766,7 +766,7 @@ impl Vproc {
+ 		})
+ 	}
+ 
+-	pub const fn has_work(&self) -> bool {
++	pub fn has_work(&self) -> bool {
+ 		!self.runs.is_empty() || !self.frames.is_empty()
+ 	}
+ 
+diff --git a/crates/shell/src/proctree.rs b/crates/shell/src/proctree.rs
+index 03cb01275b..14dfe81442 100644
+--- a/crates/shell/src/proctree.rs
++++ b/crates/shell/src/proctree.rs
+@@ -15,7 +15,7 @@ pub use omp_builtins::ProcessStatus;
+ 
+ use crate::cancel::CancelToken;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod platform {
+ 	use std::{
+ 		collections::HashSet,
+@@ -28,12 +28,35 @@ mod platform {
+ 
+ 	use super::ProcessStatus;
+ 
+-	/// Stable Linux process reference backed by a pidfd.
++	/// Stable process identity for Linux/Android processes. Linux requires a
++	/// pidfd; Android prefers one and falls back to `/proc` start-time identity.
++	#[derive(Clone)]
++	enum ProcessIdentity {
++		Pidfd {
++			pidfd:      Arc<OwnedFd>,
++			start_time: u64,
++		},
++		#[cfg(target_os = "android")]
++		ProcStartTime {
++			start_time: u64,
++		},
++	}
++
++	impl ProcessIdentity {
++		const fn start_time(&self) -> u64 {
++			match self {
++				Self::Pidfd { start_time, .. } => *start_time,
++				#[cfg(target_os = "android")]
++				Self::ProcStartTime { start_time } => *start_time,
++			}
++		}
++	}
++
++	/// Stable Linux/Android process reference.
+ 	#[derive(Clone)]
+ 	pub struct Process {
+-		pid:        i32,
+-		pidfd:      Arc<OwnedFd>,
+-		start_time: u64,
++		pid:      i32,
++		identity: ProcessIdentity,
+ 	}
+ 
+ 	impl Process {
+@@ -41,9 +64,16 @@ mod platform {
+ 			if pid <= 0 {
+ 				return None;
+ 			}
+-			let pidfd = Arc::new(sys::open_pidfd(pid)?);
+-			let start_time = sys::start_time(pid)?;
+-			Some(Self { pid, pidfd, start_time })
++			let pidfd = sys::open_pidfd(pid).map(Arc::new);
++			#[cfg(target_os = "linux")]
++			let identity =
++				ProcessIdentity::Pidfd { pidfd: pidfd?, start_time: sys::start_time(pid)? };
++			#[cfg(target_os = "android")]
++			let identity = match pidfd {
++				Some(pidfd) => ProcessIdentity::Pidfd { pidfd, start_time: sys::start_time(pid)? },
++				None => ProcessIdentity::ProcStartTime { start_time: read_live_start_time(pid)? },
++			};
++			Some(Self { pid, identity })
+ 		}
+ 
+ 		pub const fn pid(&self) -> i32 {
+@@ -147,7 +177,20 @@ mod platform {
+ 		}
+ 
+ 		pub fn kill(&self, signal: i32) -> bool {
+-			sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
++			match &self.identity {
++				ProcessIdentity::Pidfd { pidfd, .. } => sys::pidfd_send_signal(pidfd.as_fd(), signal),
++				#[cfg(target_os = "android")]
++				ProcessIdentity::ProcStartTime { .. } => {
++					// Revalidate the recorded `/proc` start time immediately before
++					// the raw signal; never signal a bare pid.
++					if !self.live_identity() {
++						return false;
++					}
++					// SAFETY: `kill` takes integer identifiers by value and does not
++					// access caller-owned memory.
++					unsafe { libc::kill(self.pid, signal) == 0 }
++				},
++			}
+ 		}
+ 
+ 		pub fn group_id(&self) -> Option<i32> {
+@@ -155,52 +198,76 @@ mod platform {
+ 				return None;
+ 			}
+ 
+-			// SAFETY: `self.pid` names the process currently referenced by
+-			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
+-			// reports failure rather than dereferencing caller-owned memory.
++			// SAFETY: `status` just confirmed that `self.pid` still has the
++			// recorded identity. If it exits concurrently, `getpgid`
++			// reports failure rather than dereferencing caller-owned
++			// memory.
+ 			let pgid = unsafe { libc::getpgid(self.pid) };
+ 			if pgid > 0 { Some(pgid) } else { None }
+ 		}
+ 
+ 		pub fn status(&self) -> ProcessStatus {
+-			loop {
+-				let mut pollfd =
+-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+-				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
+-				// the pidfd remains open for the duration of the call. Timeout
+-				// zero makes this a non-blocking readiness probe.
+-				let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+-				if ready < 0 {
+-					// Retry on EINTR; for any other transient poll error treat the
+-					// pidfd as still running. The pidfd is still owned and the
+-					// kernel has not reported the process gone — a spurious
+-					// `Exited` here makes every downstream signal/kill fall
+-					// through silently.
+-					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+-						continue;
++			match &self.identity {
++				ProcessIdentity::Pidfd { pidfd, .. } => loop {
++					let mut pollfd =
++						libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
++					// SAFETY: `pollfd` points to one initialized `pollfd` element,
++					// and the pidfd remains open for the duration of
++					// the call. Timeout zero makes this a
++					// non-blocking readiness probe.
++					let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
++					if ready < 0 {
++						// Retry on EINTR; for any other transient poll error treat
++						// the pidfd as still running. The pidfd is
++						// still owned and the kernel has not
++						// reported the process gone — a spurious
++						// `Exited` here makes every downstream signal/kill fall
++						// through silently.
++						if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
++							continue;
++						}
++						return ProcessStatus::Running;
++					}
++					if ready == 0 {
++						return ProcessStatus::Running;
++					}
++					if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
++						!= 0
++					{
++						return ProcessStatus::Exited;
+ 					}
+ 					return ProcessStatus::Running;
+-				}
+-				if ready == 0 {
+-					return ProcessStatus::Running;
+-				}
+-				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+-					!= 0
+-				{
+-					return ProcessStatus::Exited;
+-				}
+-				return ProcessStatus::Running;
++				},
++				#[cfg(target_os = "android")]
++				ProcessIdentity::ProcStartTime { start_time } => {
++					if read_live_start_time(self.pid) == Some(*start_time) {
++						ProcessStatus::Running
++					} else {
++						ProcessStatus::Exited
++					}
++				},
+ 			}
+ 		}
+ 
+-		/// Resolves once the process exits: its pidfd becomes readable then.
++		/// Resolves once the process exits, through a pidfd or `/proc` polling.
+ 		pub async fn exited(&self) -> std::io::Result<()> {
+-			let pidfd = tokio::io::unix::AsyncFd::with_interest(
+-				self.pidfd.try_clone()?,
+-				tokio::io::Interest::READABLE,
+-			)?;
+-			let _ready = pidfd.readable().await?;
+-			Ok(())
++			match &self.identity {
++				ProcessIdentity::Pidfd { pidfd, .. } => {
++					let pidfd = tokio::io::unix::AsyncFd::with_interest(
++						pidfd.try_clone()?,
++						tokio::io::Interest::READABLE,
++					)?;
++					let _ready = pidfd.readable().await?;
++					Ok(())
++				},
++				#[cfg(target_os = "android")]
++				ProcessIdentity::ProcStartTime { .. } => {
++					while self.status() == ProcessStatus::Running {
++						tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++					}
++					Ok(())
++				},
++			}
+ 		}
+ 
+ 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
+@@ -224,8 +291,24 @@ mod platform {
+ 
+ 		fn live_identity(&self) -> bool {
+ 			self.status() == ProcessStatus::Running
+-				&& sys::start_time(self.pid) == Some(self.start_time)
++				&& sys::start_time(self.pid) == Some(self.identity.start_time())
++		}
++	}
++
++	#[cfg(target_os = "android")]
++	fn read_live_start_time(pid: i32) -> Option<u64> {
++		// `/proc/[pid]/stat` field 22 is the process start time in clock ticks
++		// since boot. The comm field (between parens) may itself contain
++		// spaces and parens, so locate the *last* `)` and split the
++		// trailing whitespace-separated fields.
++		let stat_path = format!("/proc/{pid}/stat");
++		let content = fs::read_to_string(stat_path).ok()?;
++		let last_paren = content.rfind(')')?;
++		let mut fields = content[last_paren + 1..].split_whitespace();
++		if fields.next()? == "Z" {
++			return None;
+ 		}
++		fields.nth(18)?.parse().ok()
+ 	}
+ 
+ 	/// Find processes whose `/proc/{pid}/exe` symlink resolves to exactly
+@@ -239,6 +322,68 @@ mod platform {
+ 			.filter_map(Process::from_pid)
+ 			.collect()
+ 	}
++	#[cfg(all(test, target_os = "android"))]
++	mod fallback_tests {
++		use std::{process::Command, time::Duration};
++
++		use super::*;
++
++		#[tokio::test]
++		async fn proc_start_time_fallback_kills_and_observes_exit() {
++			let mut child = Command::new("sleep")
++				.arg("30")
++				.spawn()
++				.expect("spawn sleep");
++			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
++			let start_time = read_live_start_time(pid).expect("read child start time");
++			let process = Process { pid, identity: ProcessIdentity::ProcStartTime { start_time } };
++			assert_eq!(process.status(), ProcessStatus::Running);
++
++			let signaled = process.kill(libc::SIGTERM);
++			let exit_observed = tokio::time::timeout(Duration::from_secs(5), process.exited()).await;
++			let status_after_exit = process.status();
++			let signal_after_exit = process.kill(libc::SIGKILL);
++			let _ = child.kill();
++			let _ = child.wait();
++
++			assert!(signaled, "the matching start-time identity must permit signaling");
++			assert!(
++				exit_observed.is_ok_and(|result| result.is_ok()),
++				"fallback exit polling must resolve after the process exits"
++			);
++			assert_eq!(status_after_exit, ProcessStatus::Exited, "an exited/zombie child is not live");
++			assert!(!signal_after_exit, "an exited process must not be signaled");
++		}
++
++		#[test]
++		fn proc_start_time_fallback_rejects_mismatched_identity_before_kill() {
++			let mut child = Command::new("sleep")
++				.arg("30")
++				.spawn()
++				.expect("spawn sleep");
++			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
++			let start_time = read_live_start_time(pid).expect("read child start time");
++			let wrong_start_time = if start_time == u64::MAX {
++				start_time - 1
++			} else {
++				start_time + 1
++			};
++			let process = Process {
++				pid,
++				identity: ProcessIdentity::ProcStartTime { start_time: wrong_start_time },
++			};
++
++			let status = process.status();
++			let signaled = process.kill(libc::SIGKILL);
++			let original_process_survived = read_live_start_time(pid) == Some(start_time);
++			let _ = child.kill();
++			let _ = child.wait();
++
++			assert_eq!(status, ProcessStatus::Exited, "a mismatched start time is not this process");
++			assert!(!signaled, "a mismatched start-time identity must never signal the raw pid");
++			assert!(original_process_survived, "the actual process must survive the rejected signal");
++		}
++	}
+ }
+ 
+ #[cfg(target_os = "macos")]
+diff --git a/crates/shell/src/sys/proc.rs b/crates/shell/src/sys/proc.rs
+index 4a49af4f10..14f5e48220 100644
+--- a/crates/shell/src/sys/proc.rs
++++ b/crates/shell/src/sys/proc.rs
+@@ -4,10 +4,9 @@
+ //! Used by the spawner's leak checks and KILL escalation, and by
+ //! conformance harnesses to clean up after each upstream test driver. A pid can
+ //! be recycled between a scan and a signal; every signal here first pins the
+-//! scanned process: on Linux through a pidfd plus a start-time recheck (the
+-//! signal then cannot reach another process), on macOS through a start-time
+-//! recheck immediately before `kill` (the remaining window is a pid wrapping
+-//! around within microseconds).
++//! scanned process: on Linux and Android through a pidfd when available plus
++//! a start-time recheck (without a pidfd, only the recheck; like macOS, a pid
++//! wrapping around between that check and `kill` remains a narrow race).
+ 
+ use std::io;
+ 
+@@ -65,11 +64,11 @@ pub fn info(pid: i32) -> Option<ProcInfo> {
+ /// exists has `start <= now()`, and one started after the call has
+ /// `start >= ` the returned value (a "since" mark for containment checks).
+ ///
+-/// Linux: `CLOCK_BOOTTIME` floored to clock ticks with integer math, the
+-/// same floor the kernel applies to `/proc/<pid>/stat` field 22 (parsing
+-/// `/proc/uptime` as a float can be a tick off). macOS: µs since the epoch,
+-/// like `pbi_start_tvsec`/`usec` (a wall clock: a step back in time breaks
+-/// the second guarantee).
++/// Linux and Android: `CLOCK_BOOTTIME` floored to clock ticks with integer
++/// math, the same floor the kernel applies to `/proc/<pid>/stat` field 22
++/// (parsing `/proc/uptime` as a float can be a tick off). macOS: µs since the
++/// epoch, like `pbi_start_tvsec`/`usec` (a wall clock: a step back in time
++/// breaks the second guarantee).
+ pub fn now() -> io::Result<u64> {
+ 	sys::now()
+ }
+@@ -124,8 +123,8 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
+ /// The command name may itself contain spaces and parentheses, so it ends at
+ /// the *last* `)`.
+ #[cfg_attr(
+-	not(target_os = "linux"),
+-	allow(dead_code, reason = "Linux-only outside tests; the parser is tested everywhere")
++	not(any(target_os = "linux", target_os = "android")),
++	allow(dead_code, reason = "Linux/Android-only outside tests; parser is tested everywhere")
+ )]
+ fn split_stat(line: &[u8]) -> Option<(&[u8], impl Iterator<Item = &[u8]>)> {
+ 	let open = line.iter().position(|&b| b == b'(')?;
+@@ -169,7 +168,7 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
+ 	})
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod sys {
+ 	use std::{
+ 		fs,
+@@ -240,9 +239,15 @@ mod sys {
+ 		let pidfd = match pidfd_open(p.pid) {
+ 			Ok(fd) => Some(fd),
+ 			Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+-			// Kernels before 5.3: fall back to a start-time recheck.
++			// Kernels without pidfd support: fall back to the start-time recheck.
++			#[cfg(target_os = "linux")]
+ 			Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
++			#[cfg(target_os = "linux")]
+ 			Err(e) => return Err(e),
++			// Android may not provide or permit pidfds; the recheck below still
++			// prevents signalling a process whose scanned identity has changed.
++			#[cfg(target_os = "android")]
++			Err(_) => None,
+ 		};
+ 		// With the pidfd open the pid cannot be reused for another process
+ 		// while we check that it still names the scanned one.
+diff --git a/crates/shell/src/sys/socket.rs b/crates/shell/src/sys/socket.rs
+index c351de7a97..06a6a3a832 100644
+--- a/crates/shell/src/sys/socket.rs
++++ b/crates/shell/src/sys/socket.rs
+@@ -385,7 +385,7 @@ fn reverse(addr: IpAddr) -> Option<BString> {
+ 			(&raw const ss).cast(),
+ 			len,
+ 			host.as_mut_ptr(),
+-			host.len() as libc::socklen_t,
++			host.len() as _,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NAMEREQD,
+diff --git a/crates/shell/src/sys/tty.rs b/crates/shell/src/sys/tty.rs
+index c5882793dc..24fd36687b 100644
+--- a/crates/shell/src/sys/tty.rs
++++ b/crates/shell/src/sys/tty.rs
+@@ -109,13 +109,13 @@ mod unix {
+ 		(CtlChar::Start, libc::VSTART),
+ 		(CtlChar::Stop, libc::VSTOP),
+ 		(CtlChar::Susp, libc::VSUSP),
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		(CtlChar::Dsusp, libc::VDSUSP),
+ 		(CtlChar::Lnext, libc::VLNEXT),
+ 		(CtlChar::Werase, libc::VWERASE),
+ 		(CtlChar::Reprint, libc::VREPRINT),
+ 		(CtlChar::Discard, libc::VDISCARD),
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		(CtlChar::Status, libc::VSTATUS),
+ 		#[cfg(target_os = "linux")]
+ 		(CtlChar::Swtc, libc::VSWTC),
+diff --git a/crates/vfs/src/fs.rs b/crates/vfs/src/fs.rs
+index 76d67f7289..402b1c8f4c 100644
+--- a/crates/vfs/src/fs.rs
++++ b/crates/vfs/src/fs.rs
+@@ -518,8 +518,13 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
+ 	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+ 		return false;
+ 	};
++	#[cfg(target_os = "android")]
++	// Bionic exposes AT_EACCESS in linux/fcntl.h, but the libc crate omits it.
++	const ACCESS_FLAGS: libc::c_int = 0x200;
++	#[cfg(not(target_os = "android"))]
++	const ACCESS_FLAGS: libc::c_int = libc::AT_EACCESS;
+ 	// SAFETY: `path` is a NUL-terminated string alive for the call.
+-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
++	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, ACCESS_FLAGS) == 0 }
+ }
+ 
+ /// Reads a whole host file. Under a cancellable scope the read goes through
+diff --git a/crates/xfs/src/watch/inotify.rs b/crates/xfs/src/watch/inotify.rs
+index 451dfc7da5..d9401cae5d 100644
+--- a/crates/xfs/src/watch/inotify.rs
++++ b/crates/xfs/src/watch/inotify.rs
+@@ -258,8 +258,9 @@ impl State {
+ 					Some(&next) => next == b'/',
+ 				});
+ 			if gone {
+-				// SAFETY: plain syscall on a live descriptor.
+-				unsafe { libc::inotify_rm_watch(inotify, wd) };
++				// SAFETY: live descriptor; Bionic takes the watch descriptor as
++				// unsigned.
++				unsafe { libc::inotify_rm_watch(inotify, wd as _) };
+ 			}
+ 			!gone
+ 		});
+@@ -368,8 +369,9 @@ impl State {
+ 			// kernel confirms.
+ 			let path = watch.path.clone();
+ 			self.forget_below(&path, false);
+-			// SAFETY: plain syscall on a live descriptor.
+-			unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd) };
++			// SAFETY: live descriptor; Bionic takes the watch descriptor as
++			// unsigned.
++			unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd as _) };
+ 		}
+ 		Ok(())
+ 	}
+diff --git a/packages/natives/native/desktop-adapter.d.ts b/packages/natives/native/desktop-adapter.d.ts
+index 2c8ede2e85..8bac401f40 100644
+--- a/packages/natives/native/desktop-adapter.d.ts
++++ b/packages/natives/native/desktop-adapter.d.ts
+@@ -1,4 +1,9 @@
+ import type { DesktopSession } from "./index.js";
+ 
+-/** Return the current native ABI, or a constructor that rejects an outdated addon on first desktop use. */
+-export function adaptDesktopSession(NativeDesktopSession: unknown): typeof DesktopSession;
++type NativeDesktopClass = typeof DesktopSession;
++type NativeDesktopConstructor = new (...args: never[]) => unknown;
++
++/** Reject stale native ABIs on first desktop use without unsafe fallbacks. */
++export function adaptDesktopSession(NativeDesktopSession: NativeDesktopConstructor): NativeDesktopClass;
++export function adaptDesktopSession(NativeDesktopSession: undefined): undefined;
++export function adaptDesktopSession(NativeDesktopSession: NativeDesktopConstructor | undefined): NativeDesktopClass | undefined;
+diff --git a/packages/natives/native/desktop-adapter.js b/packages/natives/native/desktop-adapter.js
+index 8e8200f136..68351cbccf 100644
+--- a/packages/natives/native/desktop-adapter.js
++++ b/packages/natives/native/desktop-adapter.js
+@@ -24,8 +24,11 @@ const REQUIRED_METHODS = [
+ /** Getters the computer worker reads; without `escapeStops` it would read every run as stopped by the user's Escape. */
+ const REQUIRED_GETTERS = ["escapeStops"];
+ 
+-/** Require the current desktop ABI; partial legacy emulation cannot preserve input ownership. */
++/** Reject incomplete native ABIs on first desktop use without unsafe fallbacks. */
+ export function adaptDesktopSession(NativeDesktopSession) {
++	if (NativeDesktopSession === undefined) {
++		return undefined;
++	}
+ 	const prototype = NativeDesktopSession?.prototype;
+ 	const missing = [
+ 		...REQUIRED_METHODS.filter(method => typeof prototype?.[method] !== "function"),
+diff --git a/packages/natives/native/desktop.js b/packages/natives/native/desktop.js
+index 3ec071b3ad..4fb7c2e6e2 100644
+--- a/packages/natives/native/desktop.js
++++ b/packages/natives/native/desktop.js
+@@ -8,7 +8,13 @@ let DesktopSession;
+  * computer worker receives its initialization message.
+  */
+ export function createDesktopSession(options) {
+-	DesktopSession ??= adaptDesktopSession(loadNative().DesktopSession);
++	if (DesktopSession === undefined) {
++		const NativeDesktopSession = loadNative().DesktopSession;
++		if (NativeDesktopSession === undefined) {
++			throw new Error("Unsupported: desktop sessions are not supported on this platform.");
++		}
++		DesktopSession = adaptDesktopSession(NativeDesktopSession);
++	}
+ 	return new DesktopSession(options);
+ }
+ 
+diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
+index 3c5535ad71..96c40e2095 100644
+--- a/packages/natives/native/loader-state.js
++++ b/packages/natives/native/loader-state.js
+@@ -32,6 +32,7 @@ import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionSta
+  */
+ 
+ const SUPPORTED_PLATFORMS = [
++	"android-arm64",
+ 	"linux-x64",
+ 	"linux-arm64",
+ 	"darwin-x64",
