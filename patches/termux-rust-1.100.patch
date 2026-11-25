@@ -1,0 +1,21 @@
+commit c0237483e24442ce98ae388db77c1ac7b40d062c
+Author:     local <local@localhost>
+AuthorDate: Wed Nov 25 00:07:11 2026 +0800
+Commit:     local <local@localhost>
+CommitDate: Wed Nov 25 00:07:11 2026 +0800
+
+    fix(android): avoid Rust 1.101 const VecDeque method on Termux
+
+diff --git a/crates/shell/src/bash/vm/proc.rs b/crates/shell/src/bash/vm/proc.rs
+index c0c584db8e..018aa7c754 100644
+--- a/crates/shell/src/bash/vm/proc.rs
++++ b/crates/shell/src/bash/vm/proc.rs
+@@ -766,7 +766,7 @@ impl Vproc {
+ 		})
+ 	}
+ 
+-	pub const fn has_work(&self) -> bool {
++	pub fn has_work(&self) -> bool {
+ 		!self.runs.is_empty() || !self.frames.is_empty()
+ 	}
+ 

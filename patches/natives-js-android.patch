@@ -1,0 +1,42 @@
+--- a/natives/loader-state.js
++++ b/natives/loader-state.js
+@@ -32,6 +32,7 @@
+  */
+ 
+ const SUPPORTED_PLATFORMS = [
++	"android-arm64",
+ 	"linux-x64",
+ 	"linux-arm64",
+ 	"darwin-x64",
+--- a/natives/desktop-adapter.js
++++ b/natives/desktop-adapter.js
+@@ -24,8 +24,11 @@
+ /** Getters the computer worker reads; without `escapeStops` it would read every run as stopped by the user's Escape. */
+ const REQUIRED_GETTERS = ["escapeStops"];
+ 
+-/** Require the current desktop ABI; partial legacy emulation cannot preserve input ownership. */
++/** Reject incomplete native ABIs on first desktop use without unsafe fallbacks. */
+ export function adaptDesktopSession(NativeDesktopSession) {
++	if (NativeDesktopSession === undefined) {
++		return undefined;
++	}
+ 	const prototype = NativeDesktopSession?.prototype;
+ 	const missing = [
+ 		...REQUIRED_METHODS.filter(method => typeof prototype?.[method] !== "function"),
+--- a/natives/desktop.js
++++ b/natives/desktop.js
+@@ -8,7 +8,13 @@
+  * computer worker receives its initialization message.
+  */
+ export function createDesktopSession(options) {
+-	DesktopSession ??= adaptDesktopSession(loadNative().DesktopSession);
++	if (DesktopSession === undefined) {
++		const NativeDesktopSession = loadNative().DesktopSession;
++		if (NativeDesktopSession === undefined) {
++			throw new Error("Unsupported: desktop sessions are not supported on this platform.");
++		}
++		DesktopSession = adaptDesktopSession(NativeDesktopSession);
++	}
+ 	return new DesktopSession(options);
+ }
+ 

@@ -1,0 +1,2730 @@
+diff --git a/.github/actions/native-artifacts/action.yml b/.github/actions/native-artifacts/action.yml
+index a06f078e5d..a69767fe29 100644
+--- a/.github/actions/native-artifacts/action.yml
++++ b/.github/actions/native-artifacts/action.yml
+@@ -2,8 +2,9 @@ name: "Install native addon artifacts"
+ description: >
+    Downloads the native addons built once by the native_addons jobs and
+    installs exact targets without invoking Bazel. The linux-x64 pair ships as
+-   its own small `natives-linux-x64` artifact; the rest (`native-addons`) is
+-   fetched only when a requested target needs it.
++   its own small `natives-linux-x64` artifact; the Android ARM64 addon has a
++   separate explicit-only `natives-android-arm64` artifact; the rest
++   (`native-addons`) is fetched only when a requested target needs it.
+ 
+ inputs:
+    targets:
+@@ -31,19 +32,22 @@ runs:
+            fi
+            x64=false
+            rest=false
++           android=false
+            for t in "${targets[@]}"; do
+              case "$t" in
+                linux-x64-baseline|linux-x64-modern) x64=true ;;
++               android-arm64) android=true ;;
+                *) rest=true ;;
+              esac
+            done
+-           # ci.yml uploads `native-addons` on non-PR events only.
+-           if [ "$rest" = true ] && [ "$GITHUB_EVENT_NAME" = pull_request ]; then
++           # ci.yml uploads these artifacts on non-PR events only.
++           if { [ "$rest" = true ] || [ "$android" = true ]; } && [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+              echo "::error::PR runs only publish natives-linux-x64; targets outside linux-x64-baseline/linux-x64-modern are unavailable: $NATIVE_TARGETS"
+              exit 1
+            fi
+            echo "x64=$x64" >> "$GITHUB_OUTPUT"
+            echo "rest=$rest" >> "$GITHUB_OUTPUT"
++           echo "android=$android" >> "$GITHUB_OUTPUT"
+ 
+       - name: Download linux-x64 native addon artifact
+         if: steps.need.outputs.x64 == 'true'
+@@ -59,6 +63,13 @@ runs:
+            name: native-addons
+            path: ${{ runner.temp }}/omp-native-artifacts
+ 
++      - name: Download Android ARM64 native addon artifact
++        if: steps.need.outputs.android == 'true'
++        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
++        with:
++           name: natives-android-arm64
++           path: ${{ runner.temp }}/omp-native-artifacts/natives-android-arm64
++
+       - name: Install native addon targets
+         shell: bash
+         env:
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 59322cffa8..b64b4c6d2c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -548,6 +548,48 @@ jobs:
+               if-no-files-found: error
+               retention-days: 1
+ 
++   # Android is an explicit release-only target, not part of //:natives-all or
++   # the native npm leaves. Build it with a real NDK and publish its own
++   # artifact for the Android executable row.
++   native_addons_android:
++      name: Build explicit Android ARM64 native addon
++      if: needs.release_metadata.outputs.is-release == 'true'
++      needs: [release_metadata]
++      runs-on: omp-kata
++      steps:
++         - uses: actions/checkout@v4
++         - name: Set up Java for Android SDK
++           uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
++           with:
++              distribution: temurin
++              java-version: "17"
++         - name: Set up Android SDK and NDK
++           uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
++           with:
++              packages: "ndk;27.2.12479018"
++         - name: Export Android NDK path
++           shell: bash
++           run: |
++              set -euo pipefail
++              sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/.android/sdk}}"
++              ndk="$sdk_root/ndk/27.2.12479018"
++              test -x "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
++              echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
++         - id: cache
++           uses: ./.github/actions/bazel-cache
++         - name: Build Android ARM64 native addon
++           env:
++              OMP_NATIVE_BUILD_BACKEND: bazel
++              OMP_BAZEL_RC: ${{ steps.cache.outputs.rc }}
++           run: bun scripts/bazel-natives.ts android-arm64
++         - name: Upload Android ARM64 native addon artifact
++           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++           with:
++              name: natives-android-arm64
++              path: packages/natives/native/pi_natives.android-arm64.node
++              if-no-files-found: error
++              retention-days: 1
++
+    test_coding_agent_native:
+       name: "Test coding-agent native/unit (TS) ${{ matrix.shard }}"
+       runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'vmon-large/from=omp-ci' }}
+@@ -728,19 +770,22 @@ jobs:
+            run: bun scripts/gen-clippy-bazelrc.ts --check
+          - run: echo "release validation green"
+ 
+-   # Builds (does not publish) every release binary on one Linux x64 image in
+-   # parallel with the test fan-out; the needs are the two native_addons jobs,
+-   # whose artifacts supply their addons. bun cross-compiles every target;
+-   # macOS binaries are Developer ID signed and notarized here too
+-   # (rcodesign). release_smoke then runs each binary on its own platform.
+-   # Publishing (npm leaves, GitHub release, build.stencil.so, core npm) is gated on
+-   # release_gate downstream.
++   # Builds (does not publish) every release binary on Linux x64 in parallel
++   # with the test fan-out. The existing native_addons jobs provide Linux and
++   # cross-build targets; Android's separate release-only job supplies its
++   # explicit addon. Bun cross-compiles the executable targets.
++   # macOS binaries are Developer ID signed and notarized here too (rcodesign).
++   # release_smoke runs executable targets on their own platforms; Android gets
++   # structural ELF validation only because this workflow has no Termux device.
++   # Publishing (npm leaves, GitHub release, build.stencil.so, core npm) is gated
++   # on release_gate downstream.
+    release_binary:
+       name: "Release binary: ${{ matrix.target_id }}"
+       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+          needs.native_addons.result == 'success' &&
+-         needs.native_addons_cross.result == 'success' }}
+-      needs: [release_metadata, native_addons, native_addons_cross]
++         needs.native_addons_cross.result == 'success' &&
++         needs.native_addons_android.result == 'success' }}
++      needs: [release_metadata, native_addons, native_addons_cross, native_addons_android]
+       strategy:
+          fail-fast: false
+          matrix:
+@@ -777,6 +822,12 @@ jobs:
+                     binary_path: packages/coding-agent/binaries/omp-linux-arm64,
+                     native_targets: linux-arm64,
+                  }
++               - {
++                    platform: android,
++                    target_id: android-arm64,
++                    binary_path: packages/coding-agent/binaries/omp-android-arm64,
++                    native_targets: android-arm64,
++                 }
+                - {
+                     platform: linux,
+                     target_id: linux-musl-arm64,
+@@ -803,8 +854,13 @@ jobs:
+       steps:
+          - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
++           if: matrix.target_id != 'android-arm64'
+            with:
+               bun-version: 1.4.4
++         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
++           if: matrix.target_id == 'android-arm64'
++           with:
++              bun-version: "1.4.4"
+          - name: Restore bun store
+            id: bun-cache
+            uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+@@ -822,6 +878,16 @@ jobs:
+            env:
+               RELEASE_TARGETS: ${{ matrix.target_id }}
+            run: bun run ci:release:build-binaries
++         - name: Validate Android ARM64 executable ELF (no device smoke)
++           if: matrix.platform == 'android'
++           env:
++              BINARY: ${{ matrix.binary_path }}
++           run: |
++              set -euo pipefail
++              header="$(readelf -hW "$BINARY")"
++              grep -Eq 'Class:[[:space:]]+ELF64' <<< "$header"
++              grep -Eq 'Machine:[[:space:]]+AArch64' <<< "$header"
++              readelf -lW "$BINARY" | grep -Fq '/system/bin/linker64'
+          - name: Sign macOS binary
+            # Replaces bun's signature with a Developer ID + hardened-runtime one
+            # carrying the required JIT, Apple Events, and library-validation
+@@ -861,12 +927,13 @@ jobs:
+               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+ 
+    # Every release binary is cross-built on Linux (release_binary); this runs
+-   # each one on its own platform before anything publishes: download the
+-   # artifact, then `--version` and `--smoke-test` in a throwaway home. macOS
+-   # legs first run Apple's own signature check, and launch under the final
+-   # signature (hardened runtime and entitlements included when signed). These
+-   # are the exact bytes release_github and release_build publish, so no job
+-   # re-verifies the published assets.
++   # each runnable target on its own platform before anything publishes. Android
++   # receives structural ELF validation during its build only: without a
++   # connected Termux device, a Linux-host "smoke" would be misleading.
++   # Executable artifacts run --version and --smoke-test in a throwaway home.
++   # macOS legs first run Apple's signature check and launch under the final
++   # signature. These are the exact bytes release_github and release_build
++   # publish, so no job re-verifies the published assets.
+    release_smoke:
+       name: "Smoke release binary: ${{ matrix.target_id }}"
+       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+diff --git a/BUILD.bazel b/BUILD.bazel
+index e7e3896df1..38255630b7 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -1,4 +1,4 @@
+-# Shipping pi_natives addons, one per (platform, arch, ISA-variant).
++# Native addon targets; Android ARM64 is experimental and explicit-only.
+ # `bazel build //:natives-<target>` yields the canonically named .node file;
+ # packages/natives/scripts/build-native.ts copies it into packages/natives/native/.
+ # Note: musl addons intentionally reuse the plain linux-<arch> filenames — the
+@@ -17,6 +17,7 @@ _ADDONS = {
+     "linux-x64-baseline": ("//bazel/platforms:linux-x64-baseline", "pi_natives.linux-x64-baseline.node"),
+     "linux-x64-modern": ("//bazel/platforms:linux-x64-modern", "pi_natives.linux-x64-modern.node"),
+     "linux-arm64": ("//bazel/platforms:linux-arm64", "pi_natives.linux-arm64.node"),
++    "android-arm64": ("//bazel/platforms:android-arm64", "pi_natives.android-arm64.node"),
+     "linux-musl-x64-baseline": ("//bazel/platforms:linux-musl-x64-baseline", "pi_natives.linux-x64-baseline.node"),
+     "linux-musl-arm64": ("//bazel/platforms:linux-musl-arm64", "pi_natives.linux-arm64.node"),
+     "darwin-x64-baseline": ("//bazel/platforms:darwin-x64-baseline", "pi_natives.darwin-x64-baseline.node"),
+diff --git a/Cargo.toml b/Cargo.toml
+index 7e4ed99002..4f0b2207bb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,7 +29,7 @@ resolver = "3"
+ [workspace.package]
+ version = "19.1.1"
+ edition = "2024"
+-rust-version = "1.101"
++rust-version = "1.100"
+ license = "MIT"
+ authors = ["Stencil Labs, Inc."]
+ homepage = "https://omp.sh/"
+diff --git a/MODULE.bazel b/MODULE.bazel
+index 08765d2266..b5d62a5810 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -1,14 +1,16 @@
+ """omp — Bazel build for the native (Rust) side of the workspace.
+ 
+-Builds the pi_natives NAPI cdylib for every shipped target with hermetic
+-toolchains, replacing cargo-zigbuild/cargo-xwin/sccache plus the hand-rolled
+-CI caches with Bazel's content-addressed action cache (see infra/docs/03-caching.md).
++Builds the pi_natives NAPI cdylib for every shipped target, plus an explicit
++experimental Android ARM64 cross-target, with hermetic toolchains. This replaces
++cargo-zigbuild/cargo-xwin/sccache plus hand-rolled CI caches with Bazel's
++content-addressed action cache (see infra/docs/03-caching.md).
+ 
+ Layout:
+   //:natives-<target>      release-grade renamed .node artifacts (root BUILD.bazel)
+   //crates/...             first-party crate targets
+   //bazel/...              platforms, ISA-variant constraints, toolchains, rules
+   @crates//...             third-party crates from Cargo.lock via crate_universe
++  //:natives-android-arm64  explicit experimental Android ARM64 target
+ 
+ The cargo workspace stays authoritative for local iteration (rust-analyzer,
+ `cargo nextest`, napi typedef regeneration); Bazel is the artifact and CI
+@@ -22,6 +24,7 @@ bazel_dep(name = "bazel_skylib", version = "1.8.2")
+ bazel_dep(name = "platforms", version = "1.1.0")
+ bazel_dep(name = "rules_rust", version = "0.71.3")
+ bazel_dep(name = "hermetic_cc_toolchain", version = "4.2.0")
++bazel_dep(name = "rules_android_ndk", version = "0.1.5")
+ 
+ # zig-wrapper patches (rationale in each patch header):
+ # - zig 0.14's cache corrupts under concurrent `zig cc` (ziglang/zig#18763);
+@@ -58,6 +61,7 @@ rust.toolchain(
+     extra_target_triples = [
+         "x86_64-unknown-linux-gnu",
+         "aarch64-unknown-linux-gnu",
++        "aarch64-linux-android",
+         "x86_64-unknown-linux-musl",
+         "aarch64-unknown-linux-musl",
+         "x86_64-apple-darwin",
+@@ -91,6 +95,7 @@ rust.toolchain(
+         "2026-11-08/rust-std-nightly-aarch64-pc-windows-msvc.tar.xz": "76c1a9ab1e9efbbb77bd179f1fe365952daecfbc1796bbb19ee90754221bfcfb",
+         "2026-11-08/rust-std-nightly-aarch64-apple-darwin.tar.xz": "b281bdc8c8d0217d3d8aafbe77f763246014fd925068f41c20a6efed57e62b8c",
+         "2026-11-08/rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz": "dccff165f3cbb7fe622c11c6efdb9b18a37d38eaf2663d8c402e321f301dc178",
++        "2026-11-08/rust-std-nightly-aarch64-linux-android.tar.xz": "eeeb23fef4457ead44ac347d524e37467dbea44ad76ef996f2e939c26944cf97",
+         "2026-11-08/rust-std-nightly-aarch64-unknown-linux-musl.tar.xz": "3af90e6db4580f3b9d526cf5ee76d9cd231dc26984c9227678bbdbd8ffd2de19",
+         "2026-11-08/rust-std-nightly-x86_64-apple-darwin.tar.xz": "6b459120e0d47e01729bb91c63492c07e70ef6f6fe081721a09d8c4886e5f16c",
+         "2026-11-08/rust-std-nightly-x86_64-pc-windows-msvc.tar.xz": "d1d26602d89f981f07e0607be5b4f35764e0f8b2413801c294f4b682b335d314",
+@@ -131,6 +136,14 @@ register_toolchains("//bazel/toolchains:all")
+ 
+ register_toolchains("@rust_toolchains//:all")
+ 
++# --- Android NDK toolchain ----------------------------------------------------
++# Keep the local NDK repository lazy: desktop Bazel builds must not require
++# ANDROID_NDK_HOME. The installer opts into the C++ toolchain only when an
++# Android target is requested; rules_android_ndk 0.1.5 supports NDK 25b+.
++android_ndk = use_extension("@rules_android_ndk//:extension.bzl", "android_ndk_repository_extension")
++android_ndk.configure(api_level = 28)
++use_repo(android_ndk, "androidndk")
++
+ # --- C/C++ toolchains ---------------------------------------------------------
+ # zig cc provides hermetic linux-gnu (pinned glibc 2.17 portability floor, same
+ # floor cargo-zigbuild used) and linux-musl cross toolchains, executable from
+@@ -177,12 +190,13 @@ crate.from_cargo(
+     # crates (members so their sources render hermetically; the
+     # [patch.crates-io] entries redirect registry deps to them).
+     manifests = ["//:Cargo.toml"],
+-    # Exactly the shipped addon triples: crate BUILD files get
+-    # target_compatible_with selects over this set (defaults omit darwin-x64
+-    # and musl), and features/deps resolve per-triple from Cargo.lock.
++    # Shipped addon triples plus the explicit experimental Android ARM64 target;
++    # crate BUILD files use target_compatible_with to select over this set
++    # (defaults omit darwin-x64 and musl), and features/deps resolve per triple.
+     supported_platform_triples = [
+         "x86_64-unknown-linux-gnu",
+         "aarch64-unknown-linux-gnu",
++        "aarch64-linux-android",
+         "x86_64-unknown-linux-musl",
+         "aarch64-unknown-linux-musl",
+         "x86_64-apple-darwin",
+@@ -192,10 +206,15 @@ crate.from_cargo(
+     ],
+ )
+ 
+-# opusic-sys builds its bundled Opus via `cmake` and selects Ninja from PATH.
+-# The target-specific toolchain keeps MSVC cross builds on the wrapper
+-# compiler/linker; CFLAGS keeps Zig cross builds free of host UBSan links.
++# opusic-sys expects ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake to
++# select its Android ABI, but rules_android_ndk intentionally exposes only the
++# compiler/sysroot subset of the NDK. Supply a small adapter at that expected
++# path. rules_rust already adds the resolved cc_toolchain's all_files to build
++# script actions, so no second NDK input is needed.
++# The Android-only ANDROID_NDK_HOME below locates the adapter; actual NDK
++# discovery remains in the lazy rules_android_ndk repository using host config.
+ crate.annotation(
++    build_script_data = ["@@//bazel/toolchains/android:cmake_toolchain"],
+     build_script_env = {
+         "CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc": "$${pwd}/external/+msvc_cc_repository+msvc_cc/toolchain.cmake",
+         "CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc": "$${pwd}/external/+msvc_cc_repository+msvc_cc_arm64/toolchain.cmake",
+@@ -210,6 +229,16 @@ crate.annotation(
+     version = "0.7.5",
+ )
+ 
++crate.annotation_select(
++    build_script_env = {
++        "ANDROID_NDK_HOME": "$${pwd}/bazel/toolchains/android",
++        "ANDROID_NDK_ROOT": "$${pwd}/external/rules_android_ndk++android_ndk_repository_extension+androidndk",
++        "ANDROID_PLATFORM": "android-28",
++    },
++    crate = "opusic-sys",
++    triples = ["aarch64-linux-android"],
++)
++
+ # wasmtime-c-api-impl (tree-sitter's `wasm` feature) runs `cmake -P` to install
+ # the C API headers tree-sitter compiles against; same host PATH as opusic-sys.
+ crate.annotation(
+diff --git a/bazel/platforms/BUILD.bazel b/bazel/platforms/BUILD.bazel
+index bb06df90f2..cb137a8c2f 100644
+--- a/bazel/platforms/BUILD.bazel
++++ b/bazel/platforms/BUILD.bazel
+@@ -35,6 +35,14 @@ platform(
+     parents = ["@zig_sdk//libc_aware/platform:linux_arm64_musl"],
+ )
+ 
++platform(
++    name = "android-arm64",
++    constraint_values = [
++        "@platforms//os:android",
++        "@platforms//cpu:aarch64",
++    ],
++)
++
+ platform(
+     name = "darwin-x64-baseline",
+     constraint_values = [
+diff --git a/bazel/toolchains/android/BUILD.bazel b/bazel/toolchains/android/BUILD.bazel
+new file mode 100644
+index 0000000000..22264621a2
+--- /dev/null
++++ b/bazel/toolchains/android/BUILD.bazel
+@@ -0,0 +1,7 @@
++# The Android NDK CMake adapter is a build-script input for opusic-sys.
++package(default_visibility = ["//visibility:public"])
++
++filegroup(
++    name = "cmake_toolchain",
++    srcs = ["build/cmake/android.toolchain.cmake"],
++)
+diff --git a/bazel/toolchains/android/build/cmake/android.toolchain.cmake b/bazel/toolchains/android/build/cmake/android.toolchain.cmake
+new file mode 100644
+index 0000000000..280e201ac1
+--- /dev/null
++++ b/bazel/toolchains/android/build/cmake/android.toolchain.cmake
+@@ -0,0 +1,20 @@
++# Adapter for opusic-sys' bundled Opus build under Bazel.
++#
++# rules_android_ndk exports the NDK's Clang toolchain and sysroot, but not the
++# NDK's build/cmake metadata consumed by its upstream android.toolchain.cmake.
++# CMake's legacy Android mode avoids rediscovering that missing metadata; the
++# Bazel-selected compiler flags still target API 28 and the declared NDK sysroot
++# below supplies Android headers and libraries.
++set(CMAKE_SYSTEM_NAME Android)
++set(CMAKE_SYSTEM_VERSION 1)
++set(CMAKE_SYSTEM_PROCESSOR aarch64)
++set(CMAKE_ANDROID_ARCH_ABI arm64-v8a)
++set(CMAKE_ANDROID_API 28)
++
++set(_OMP_ANDROID_SYSROOT "$ENV{ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot")
++set(CMAKE_SYSROOT "${_OMP_ANDROID_SYSROOT}")
++set(CMAKE_FIND_ROOT_PATH "${_OMP_ANDROID_SYSROOT}")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+diff --git a/bazel/triples/BUILD.bazel b/bazel/triples/BUILD.bazel
+index 279af1a4e0..fb5075402b 100644
+--- a/bazel/triples/BUILD.bazel
++++ b/bazel/triples/BUILD.bazel
+@@ -74,6 +74,15 @@ config_setting(
+     ],
+ )
+ 
++# Rust's aarch64-linux-android target selects the Android OS/ARM64 platform.
++config_setting(
++    name = "aarch64-linux-android",
++    constraint_values = [
++        "@platforms//os:android",
++        "@platforms//cpu:aarch64",
++    ],
++)
++
+ config_setting(
+     name = "x86_64-apple-darwin",
+     constraint_values = [
+diff --git a/crates/builtins/src/lib.rs b/crates/builtins/src/lib.rs
+index e6bbc40a5b..4b6e5e20b3 100644
+--- a/crates/builtins/src/lib.rs
++++ b/crates/builtins/src/lib.rs
+@@ -281,6 +281,6 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
+ /// implementation.
+ #[cfg(all(
+ 	feature = "util.procs",
+-	any(target_os = "linux", target_os = "macos", target_os = "windows")
++	any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows")
+ ))]
+ pub use proc_snapshot::sys as proc_sys;
+diff --git a/crates/builtins/src/pkill.rs b/crates/builtins/src/pkill.rs
+index cb12deee5c..a7abe3ecd4 100644
+--- a/crates/builtins/src/pkill.rs
++++ b/crates/builtins/src/pkill.rs
+@@ -64,4 +64,7 @@ mod tests {
+ 		assert_eq!(signal_number("NOPE"), None);
+ 		assert_eq!(signal_number("-1"), None);
+ 	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	mod realtime_signal_tests;
+ }
+diff --git a/crates/builtins/src/pkill/tests/realtime_signal_tests.rs b/crates/builtins/src/pkill/tests/realtime_signal_tests.rs
+new file mode 100644
+index 0000000000..8c65df275d
+--- /dev/null
++++ b/crates/builtins/src/pkill/tests/realtime_signal_tests.rs
+@@ -0,0 +1,10 @@
++use super::run;
++
++#[tokio::test]
++async fn realtime_signal_bounds_reach_the_builtin_without_signalling() {
++	let max = libc::SIGRTMAX();
++	let max_arg = format!("-{max}");
++	let past_max_arg = format!("-{}", max + 1);
++	assert_eq!(run(&[&max_arg]).await, 1);
++	assert_eq!(run(&[&past_max_arg]).await, 2);
++}
+diff --git a/crates/builtins/src/proc_snapshot.rs b/crates/builtins/src/proc_snapshot.rs
+index 7bbe5a2628..c60744a4a8 100644
+--- a/crates/builtins/src/proc_snapshot.rs
++++ b/crates/builtins/src/proc_snapshot.rs
+@@ -116,7 +116,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
+ }
+ 
+ /// Linux process primitives: procfs and pidfds.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "android", target_os = "linux"))]
+ pub mod sys {
+ 	use std::{
+ 		fs,
+@@ -197,7 +197,7 @@ pub mod sys {
+ 	}
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "android", target_os = "linux"))]
+ mod proc_snapshot {
+ 	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
+ 
+@@ -364,6 +364,21 @@ mod proc_snapshot {
+ 				return alive();
+ 			}
+ 			let Some(pidfd) = sys::open_pidfd(self.pid) else {
++				#[cfg(target_os = "android")]
++				{
++					if queue.is_some() {
++						return false;
++					}
++					let Some(stat) = read_stat(self.pid) else {
++						return false;
++					};
++					if stat.start_time != self.stat.start_time || stat.state == 'Z' {
++						return false;
++					}
++					// SAFETY: kill takes scalar arguments and no pointers.
++					return unsafe { libc::kill(self.pid, signal) == 0 };
++				}
++				#[cfg(target_os = "linux")]
+ 				return false;
+ 			};
+ 			if !alive() {
+@@ -490,6 +505,7 @@ mod proc_snapshot {
+ 		Some((ids.next()?, ids.next()?))
+ 	}
+ 
++	#[cfg(target_os = "linux")]
+ 	fn uptime_seconds() -> Option<f64> {
+ 		fs::read_to_string("/proc/uptime")
+ 			.ok()?
+@@ -499,6 +515,19 @@ mod proc_snapshot {
+ 			.ok()
+ 	}
+ 
++	#[cfg(target_os = "android")]
++	fn uptime_seconds() -> Option<f64> {
++		let mut uptime = libc::timespec {
++			tv_sec:  0,
++			tv_nsec: 0,
++		};
++		// SAFETY: clock_gettime writes one initialized timespec to a valid pointer.
++		if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut uptime) } != 0 {
++			return None;
++		}
++		Some(uptime.tv_sec as f64 + uptime.tv_nsec as f64 / 1_000_000_000.0)
++	}
++
+ 	fn clock_ticks() -> Option<u64> {
+ 		// SAFETY: sysconf reads a process-global constant.
+ 		u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+@@ -1876,7 +1905,7 @@ mod proc_snapshot {
+ 	}
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+ 
+ /// The processes a signal must never reach: this one and its ancestors.
+@@ -1900,7 +1929,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+ ///
+ /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
+ /// them. Only signalling consults this.
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ pub struct HostProcesses {
+ 	/// This process and its ancestors, nearest first.
+ 	pub pids:  smallvec::SmallVec<[i32; 16]>,
+@@ -1913,17 +1942,17 @@ pub struct HostProcesses {
+ /// Keeping the walk over this rather than over [`ProcInfo`] lets the recycling
+ /// cases — which are otherwise only reachable by winning a race against the OS —
+ /// be tested with a synthetic tree.
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ #[derive(Clone, Copy)]
+ struct ChainNode {
+ 	ppid:  Option<i32>,
+ 	pgid:  Option<i32>,
+-	/// Platform start time. Monotonic on all three supported platforms, so a
+-	/// larger value means the process started later.
++	/// Platform start time. Monotonic on every supported platform, so a larger
++	/// value means the process started later.
+ 	start: u64,
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows"))]
+ impl HostProcesses {
+ 	/// Whether signalling `target` would reach this process or one of its
+ 	/// ancestors.
+diff --git a/crates/builtins/src/ps.rs b/crates/builtins/src/ps.rs
+index 8ea2936005..1ab61a75c5 100644
+--- a/crates/builtins/src/ps.rs
++++ b/crates/builtins/src/ps.rs
+@@ -1281,7 +1281,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
+ 	}
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "android", target_os = "linux"))]
+ fn ps_total_memory_bytes() -> Option<u64> {
+ 	let value = fs::read_to_string("/proc/meminfo")
+ 		.ok()?
+diff --git a/crates/builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
+index d28e8c0672..d726f0a08f 100644
+--- a/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
++++ b/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
+@@ -40,7 +40,9 @@ pub(super) fn gai_text(code: i32) -> String {
+ 		return format!("Unknown error {code}");
+ 	}
+ 	// SAFETY: non-null, NUL-terminated, static.
+-	unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
++	unsafe { CStr::from_ptr(text) }
++		.to_string_lossy()
++		.into_owned()
+ }
+ 
+ /// Address family for `-4`/`-6`.
+@@ -75,7 +77,10 @@ pub(super) fn resolve(
+ 	passive: bool,
+ ) -> Result<Vec<Addr>, i32> {
+ 	let host = host.map(CString::new).transpose().map_err(|_| EAI_NONAME)?;
+-	let service = service.map(CString::new).transpose().map_err(|_| EAI_NONAME)?;
++	let service = service
++		.map(CString::new)
++		.transpose()
++		.map_err(|_| EAI_NONAME)?;
+ 	// SAFETY: an all-zero addrinfo is a valid "no hints" value.
+ 	let mut hints: libc::addrinfo = unsafe { zeroed() };
+ 	hints.ai_family = family;
+@@ -139,7 +144,7 @@ pub(super) fn numeric_host(addr: &Addr) -> String {
+ 			addr.as_ptr(),
+ 			addr.len,
+ 			buf.as_mut_ptr(),
+-			buf.len() as libc::socklen_t,
++			buf.len() as _,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NUMERICHOST,
+@@ -149,7 +154,9 @@ pub(super) fn numeric_host(addr: &Addr) -> String {
+ 		return format!("*getnameinfo failure: {}*", gai_text(rc));
+ 	}
+ 	// SAFETY: getnameinfo NUL-terminated the buffer on success.
+-	unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
++	unsafe { CStr::from_ptr(buf.as_ptr()) }
++		.to_string_lossy()
++		.into_owned()
+ }
+ 
+ /// A socket being connected.
+@@ -204,7 +211,11 @@ impl Socket {
+ 		if flags < 0 {
+ 			return Err(io::Error::last_os_error());
+ 		}
+-		let flags = if on { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
++		let flags = if on {
++			flags | libc::O_NONBLOCK
++		} else {
++			flags & !libc::O_NONBLOCK
++		};
+ 		// SAFETY: valid fd.
+ 		if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+ 			return Err(io::Error::last_os_error());
+diff --git a/crates/builtins/src/rsync/tree/sys.rs b/crates/builtins/src/rsync/tree/sys.rs
+index e15c133f23..3de49d2c46 100644
+--- a/crates/builtins/src/rsync/tree/sys.rs
++++ b/crates/builtins/src/rsync/tree/sys.rs
+@@ -269,10 +269,17 @@ pub(crate) fn mknodat(
+ 
+ /// `mkfifoat(dir, name, mode)`.
+ pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
+-	check(retry(|| {
+-		// SAFETY: valid C string and dirfd.
+-		unsafe { libc::mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
+-	}))
++	#[cfg(target_os = "android")]
++	{
++		mknodat(dir, name, mode | libc::S_IFIFO, 0)
++	}
++	#[cfg(not(target_os = "android"))]
++	{
++		check(retry(|| {
++			// SAFETY: valid C string and dirfd.
++			unsafe { libc::mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
++		}))
++	}
+ }
+ 
+ /// Names in the directory `fd` (opened for reading), without `.` and `..`.
+diff --git a/crates/natives/Cargo.toml b/crates/natives/Cargo.toml
+index 97f698e06a..7c1e81806a 100644
+--- a/crates/natives/Cargo.toml
++++ b/crates/natives/Cargo.toml
+@@ -18,7 +18,6 @@ workspace = true
+ [dependencies]
+ anyhow.workspace = true
+ async-trait.workspace = true
+-arboard.workspace = true
+ base64.workspace = true
+ fontdue.workspace = true
+ grep-matcher.workspace = true
+@@ -95,6 +94,9 @@ objc2-application-services = { version = "=0.3.2", default-features = true }
+ objc2-core-foundation = "=0.3.2"
+ unicode-bidi = "=0.3.18"
+ 
++[target.'cfg(not(target_os = "android"))'.dependencies]
++arboard.workspace = true
++
+ [target.'cfg(unix)'.dependencies]
+ libc.workspace = true
+ 
+diff --git a/crates/natives/src/desktop/control.rs b/crates/natives/src/desktop/control.rs
+index d49256992f..788bd4192d 100644
+--- a/crates/natives/src/desktop/control.rs
++++ b/crates/natives/src/desktop/control.rs
+@@ -710,6 +710,7 @@ impl ControlLease {
+ 
+ 	fn background(source: &CancellationSource) -> CoreResult<Self> {
+ 		Ok(Self {
++			#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+ 			_escape: None,
+ 			_kernel: KernelOwner::acquire(source.0.agent.clone())?,
+ 			running: AtomicBool::new(false),
+@@ -1296,7 +1297,12 @@ pub(crate) fn grant_for_test(source: &CancellationSource) {
+ 			Err(error) => panic!("test kernel owner: {error:?}"),
+ 		}
+ 	};
+-	let owner = ControlLease { _escape: None, _kernel: kernel, running: AtomicBool::new(false) };
++	let owner = ControlLease {
++		#[cfg(any(target_os = "macos", target_os = "linux", windows))]
++		_escape: None,
++		_kernel: kernel,
++		running: AtomicBool::new(false),
++	};
+ 	*source.0.state.lock() = Some(Arc::new(owner));
+ }
+ 
+diff --git a/crates/natives/src/lib.rs b/crates/natives/src/lib.rs
+index af3a083d5d..45f74d8f85 100644
+--- a/crates/natives/src/lib.rs
++++ b/crates/natives/src/lib.rs
+@@ -30,10 +30,12 @@ pub mod audio;
+ pub mod block;
+ #[cfg(all(target_os = "linux", target_env = "gnu"))]
+ mod bundled_libc;
++#[cfg(not(target_os = "android"))]
+ pub mod clipboard;
+ pub mod console_input;
+ pub mod console_threads;
+ pub mod crash_handler;
++#[cfg(not(target_os = "android"))]
+ pub mod desktop;
+ pub mod devicecheck;
+ pub mod diff;
+diff --git a/crates/shell/src/bash/vm/proc.rs b/crates/shell/src/bash/vm/proc.rs
+index c0c584db8e..018aa7c754 100644
+--- a/crates/shell/src/bash/vm/proc.rs
++++ b/crates/shell/src/bash/vm/proc.rs
+@@ -766,7 +766,7 @@ impl Vproc {
+ 		})
+ 	}
+ 
+-	pub const fn has_work(&self) -> bool {
++	pub fn has_work(&self) -> bool {
+ 		!self.runs.is_empty() || !self.frames.is_empty()
+ 	}
+ 
+diff --git a/crates/shell/src/proctree.rs b/crates/shell/src/proctree.rs
+index 03cb01275b..14dfe81442 100644
+--- a/crates/shell/src/proctree.rs
++++ b/crates/shell/src/proctree.rs
+@@ -15,7 +15,7 @@ pub use omp_builtins::ProcessStatus;
+ 
+ use crate::cancel::CancelToken;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod platform {
+ 	use std::{
+ 		collections::HashSet,
+@@ -28,12 +28,35 @@ mod platform {
+ 
+ 	use super::ProcessStatus;
+ 
+-	/// Stable Linux process reference backed by a pidfd.
++	/// Stable process identity for Linux/Android processes. Linux requires a
++	/// pidfd; Android prefers one and falls back to `/proc` start-time identity.
++	#[derive(Clone)]
++	enum ProcessIdentity {
++		Pidfd {
++			pidfd:      Arc<OwnedFd>,
++			start_time: u64,
++		},
++		#[cfg(target_os = "android")]
++		ProcStartTime {
++			start_time: u64,
++		},
++	}
++
++	impl ProcessIdentity {
++		const fn start_time(&self) -> u64 {
++			match self {
++				Self::Pidfd { start_time, .. } => *start_time,
++				#[cfg(target_os = "android")]
++				Self::ProcStartTime { start_time } => *start_time,
++			}
++		}
++	}
++
++	/// Stable Linux/Android process reference.
+ 	#[derive(Clone)]
+ 	pub struct Process {
+-		pid:        i32,
+-		pidfd:      Arc<OwnedFd>,
+-		start_time: u64,
++		pid:      i32,
++		identity: ProcessIdentity,
+ 	}
+ 
+ 	impl Process {
+@@ -41,9 +64,16 @@ mod platform {
+ 			if pid <= 0 {
+ 				return None;
+ 			}
+-			let pidfd = Arc::new(sys::open_pidfd(pid)?);
+-			let start_time = sys::start_time(pid)?;
+-			Some(Self { pid, pidfd, start_time })
++			let pidfd = sys::open_pidfd(pid).map(Arc::new);
++			#[cfg(target_os = "linux")]
++			let identity =
++				ProcessIdentity::Pidfd { pidfd: pidfd?, start_time: sys::start_time(pid)? };
++			#[cfg(target_os = "android")]
++			let identity = match pidfd {
++				Some(pidfd) => ProcessIdentity::Pidfd { pidfd, start_time: sys::start_time(pid)? },
++				None => ProcessIdentity::ProcStartTime { start_time: read_live_start_time(pid)? },
++			};
++			Some(Self { pid, identity })
+ 		}
+ 
+ 		pub const fn pid(&self) -> i32 {
+@@ -147,7 +177,20 @@ mod platform {
+ 		}
+ 
+ 		pub fn kill(&self, signal: i32) -> bool {
+-			sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
++			match &self.identity {
++				ProcessIdentity::Pidfd { pidfd, .. } => sys::pidfd_send_signal(pidfd.as_fd(), signal),
++				#[cfg(target_os = "android")]
++				ProcessIdentity::ProcStartTime { .. } => {
++					// Revalidate the recorded `/proc` start time immediately before
++					// the raw signal; never signal a bare pid.
++					if !self.live_identity() {
++						return false;
++					}
++					// SAFETY: `kill` takes integer identifiers by value and does not
++					// access caller-owned memory.
++					unsafe { libc::kill(self.pid, signal) == 0 }
++				},
++			}
+ 		}
+ 
+ 		pub fn group_id(&self) -> Option<i32> {
+@@ -155,52 +198,76 @@ mod platform {
+ 				return None;
+ 			}
+ 
+-			// SAFETY: `self.pid` names the process currently referenced by
+-			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
+-			// reports failure rather than dereferencing caller-owned memory.
++			// SAFETY: `status` just confirmed that `self.pid` still has the
++			// recorded identity. If it exits concurrently, `getpgid`
++			// reports failure rather than dereferencing caller-owned
++			// memory.
+ 			let pgid = unsafe { libc::getpgid(self.pid) };
+ 			if pgid > 0 { Some(pgid) } else { None }
+ 		}
+ 
+ 		pub fn status(&self) -> ProcessStatus {
+-			loop {
+-				let mut pollfd =
+-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+-				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
+-				// the pidfd remains open for the duration of the call. Timeout
+-				// zero makes this a non-blocking readiness probe.
+-				let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+-				if ready < 0 {
+-					// Retry on EINTR; for any other transient poll error treat the
+-					// pidfd as still running. The pidfd is still owned and the
+-					// kernel has not reported the process gone — a spurious
+-					// `Exited` here makes every downstream signal/kill fall
+-					// through silently.
+-					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+-						continue;
++			match &self.identity {
++				ProcessIdentity::Pidfd { pidfd, .. } => loop {
++					let mut pollfd =
++						libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
++					// SAFETY: `pollfd` points to one initialized `pollfd` element,
++					// and the pidfd remains open for the duration of
++					// the call. Timeout zero makes this a
++					// non-blocking readiness probe.
++					let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
++					if ready < 0 {
++						// Retry on EINTR; for any other transient poll error treat
++						// the pidfd as still running. The pidfd is
++						// still owned and the kernel has not
++						// reported the process gone — a spurious
++						// `Exited` here makes every downstream signal/kill fall
++						// through silently.
++						if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
++							continue;
++						}
++						return ProcessStatus::Running;
++					}
++					if ready == 0 {
++						return ProcessStatus::Running;
++					}
++					if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
++						!= 0
++					{
++						return ProcessStatus::Exited;
+ 					}
+ 					return ProcessStatus::Running;
+-				}
+-				if ready == 0 {
+-					return ProcessStatus::Running;
+-				}
+-				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+-					!= 0
+-				{
+-					return ProcessStatus::Exited;
+-				}
+-				return ProcessStatus::Running;
++				},
++				#[cfg(target_os = "android")]
++				ProcessIdentity::ProcStartTime { start_time } => {
++					if read_live_start_time(self.pid) == Some(*start_time) {
++						ProcessStatus::Running
++					} else {
++						ProcessStatus::Exited
++					}
++				},
+ 			}
+ 		}
+ 
+-		/// Resolves once the process exits: its pidfd becomes readable then.
++		/// Resolves once the process exits, through a pidfd or `/proc` polling.
+ 		pub async fn exited(&self) -> std::io::Result<()> {
+-			let pidfd = tokio::io::unix::AsyncFd::with_interest(
+-				self.pidfd.try_clone()?,
+-				tokio::io::Interest::READABLE,
+-			)?;
+-			let _ready = pidfd.readable().await?;
+-			Ok(())
++			match &self.identity {
++				ProcessIdentity::Pidfd { pidfd, .. } => {
++					let pidfd = tokio::io::unix::AsyncFd::with_interest(
++						pidfd.try_clone()?,
++						tokio::io::Interest::READABLE,
++					)?;
++					let _ready = pidfd.readable().await?;
++					Ok(())
++				},
++				#[cfg(target_os = "android")]
++				ProcessIdentity::ProcStartTime { .. } => {
++					while self.status() == ProcessStatus::Running {
++						tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++					}
++					Ok(())
++				},
++			}
+ 		}
+ 
+ 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
+@@ -224,8 +291,24 @@ mod platform {
+ 
+ 		fn live_identity(&self) -> bool {
+ 			self.status() == ProcessStatus::Running
+-				&& sys::start_time(self.pid) == Some(self.start_time)
++				&& sys::start_time(self.pid) == Some(self.identity.start_time())
++		}
++	}
++
++	#[cfg(target_os = "android")]
++	fn read_live_start_time(pid: i32) -> Option<u64> {
++		// `/proc/[pid]/stat` field 22 is the process start time in clock ticks
++		// since boot. The comm field (between parens) may itself contain
++		// spaces and parens, so locate the *last* `)` and split the
++		// trailing whitespace-separated fields.
++		let stat_path = format!("/proc/{pid}/stat");
++		let content = fs::read_to_string(stat_path).ok()?;
++		let last_paren = content.rfind(')')?;
++		let mut fields = content[last_paren + 1..].split_whitespace();
++		if fields.next()? == "Z" {
++			return None;
+ 		}
++		fields.nth(18)?.parse().ok()
+ 	}
+ 
+ 	/// Find processes whose `/proc/{pid}/exe` symlink resolves to exactly
+@@ -239,6 +322,68 @@ mod platform {
+ 			.filter_map(Process::from_pid)
+ 			.collect()
+ 	}
++	#[cfg(all(test, target_os = "android"))]
++	mod fallback_tests {
++		use std::{process::Command, time::Duration};
++
++		use super::*;
++
++		#[tokio::test]
++		async fn proc_start_time_fallback_kills_and_observes_exit() {
++			let mut child = Command::new("sleep")
++				.arg("30")
++				.spawn()
++				.expect("spawn sleep");
++			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
++			let start_time = read_live_start_time(pid).expect("read child start time");
++			let process = Process { pid, identity: ProcessIdentity::ProcStartTime { start_time } };
++			assert_eq!(process.status(), ProcessStatus::Running);
++
++			let signaled = process.kill(libc::SIGTERM);
++			let exit_observed = tokio::time::timeout(Duration::from_secs(5), process.exited()).await;
++			let status_after_exit = process.status();
++			let signal_after_exit = process.kill(libc::SIGKILL);
++			let _ = child.kill();
++			let _ = child.wait();
++
++			assert!(signaled, "the matching start-time identity must permit signaling");
++			assert!(
++				exit_observed.is_ok_and(|result| result.is_ok()),
++				"fallback exit polling must resolve after the process exits"
++			);
++			assert_eq!(status_after_exit, ProcessStatus::Exited, "an exited/zombie child is not live");
++			assert!(!signal_after_exit, "an exited process must not be signaled");
++		}
++
++		#[test]
++		fn proc_start_time_fallback_rejects_mismatched_identity_before_kill() {
++			let mut child = Command::new("sleep")
++				.arg("30")
++				.spawn()
++				.expect("spawn sleep");
++			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
++			let start_time = read_live_start_time(pid).expect("read child start time");
++			let wrong_start_time = if start_time == u64::MAX {
++				start_time - 1
++			} else {
++				start_time + 1
++			};
++			let process = Process {
++				pid,
++				identity: ProcessIdentity::ProcStartTime { start_time: wrong_start_time },
++			};
++
++			let status = process.status();
++			let signaled = process.kill(libc::SIGKILL);
++			let original_process_survived = read_live_start_time(pid) == Some(start_time);
++			let _ = child.kill();
++			let _ = child.wait();
++
++			assert_eq!(status, ProcessStatus::Exited, "a mismatched start time is not this process");
++			assert!(!signaled, "a mismatched start-time identity must never signal the raw pid");
++			assert!(original_process_survived, "the actual process must survive the rejected signal");
++		}
++	}
+ }
+ 
+ #[cfg(target_os = "macos")]
+diff --git a/crates/shell/src/sys/proc.rs b/crates/shell/src/sys/proc.rs
+index 4a49af4f10..14f5e48220 100644
+--- a/crates/shell/src/sys/proc.rs
++++ b/crates/shell/src/sys/proc.rs
+@@ -4,10 +4,9 @@
+ //! Used by the spawner's leak checks and KILL escalation, and by
+ //! conformance harnesses to clean up after each upstream test driver. A pid can
+ //! be recycled between a scan and a signal; every signal here first pins the
+-//! scanned process: on Linux through a pidfd plus a start-time recheck (the
+-//! signal then cannot reach another process), on macOS through a start-time
+-//! recheck immediately before `kill` (the remaining window is a pid wrapping
+-//! around within microseconds).
++//! scanned process: on Linux and Android through a pidfd when available plus
++//! a start-time recheck (without a pidfd, only the recheck; like macOS, a pid
++//! wrapping around between that check and `kill` remains a narrow race).
+ 
+ use std::io;
+ 
+@@ -65,11 +64,11 @@ pub fn info(pid: i32) -> Option<ProcInfo> {
+ /// exists has `start <= now()`, and one started after the call has
+ /// `start >= ` the returned value (a "since" mark for containment checks).
+ ///
+-/// Linux: `CLOCK_BOOTTIME` floored to clock ticks with integer math, the
+-/// same floor the kernel applies to `/proc/<pid>/stat` field 22 (parsing
+-/// `/proc/uptime` as a float can be a tick off). macOS: µs since the epoch,
+-/// like `pbi_start_tvsec`/`usec` (a wall clock: a step back in time breaks
+-/// the second guarantee).
++/// Linux and Android: `CLOCK_BOOTTIME` floored to clock ticks with integer
++/// math, the same floor the kernel applies to `/proc/<pid>/stat` field 22
++/// (parsing `/proc/uptime` as a float can be a tick off). macOS: µs since the
++/// epoch, like `pbi_start_tvsec`/`usec` (a wall clock: a step back in time
++/// breaks the second guarantee).
+ pub fn now() -> io::Result<u64> {
+ 	sys::now()
+ }
+@@ -124,8 +123,8 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
+ /// The command name may itself contain spaces and parentheses, so it ends at
+ /// the *last* `)`.
+ #[cfg_attr(
+-	not(target_os = "linux"),
+-	allow(dead_code, reason = "Linux-only outside tests; the parser is tested everywhere")
++	not(any(target_os = "linux", target_os = "android")),
++	allow(dead_code, reason = "Linux/Android-only outside tests; parser is tested everywhere")
+ )]
+ fn split_stat(line: &[u8]) -> Option<(&[u8], impl Iterator<Item = &[u8]>)> {
+ 	let open = line.iter().position(|&b| b == b'(')?;
+@@ -169,7 +168,7 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
+ 	})
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod sys {
+ 	use std::{
+ 		fs,
+@@ -240,9 +239,15 @@ mod sys {
+ 		let pidfd = match pidfd_open(p.pid) {
+ 			Ok(fd) => Some(fd),
+ 			Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+-			// Kernels before 5.3: fall back to a start-time recheck.
++			// Kernels without pidfd support: fall back to the start-time recheck.
++			#[cfg(target_os = "linux")]
+ 			Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
++			#[cfg(target_os = "linux")]
+ 			Err(e) => return Err(e),
++			// Android may not provide or permit pidfds; the recheck below still
++			// prevents signalling a process whose scanned identity has changed.
++			#[cfg(target_os = "android")]
++			Err(_) => None,
+ 		};
+ 		// With the pidfd open the pid cannot be reused for another process
+ 		// while we check that it still names the scanned one.
+diff --git a/crates/shell/src/sys/socket.rs b/crates/shell/src/sys/socket.rs
+index c351de7a97..06a6a3a832 100644
+--- a/crates/shell/src/sys/socket.rs
++++ b/crates/shell/src/sys/socket.rs
+@@ -385,7 +385,7 @@ fn reverse(addr: IpAddr) -> Option<BString> {
+ 			(&raw const ss).cast(),
+ 			len,
+ 			host.as_mut_ptr(),
+-			host.len() as libc::socklen_t,
++			host.len() as _,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NAMEREQD,
+diff --git a/crates/shell/src/sys/tty.rs b/crates/shell/src/sys/tty.rs
+index c5882793dc..24fd36687b 100644
+--- a/crates/shell/src/sys/tty.rs
++++ b/crates/shell/src/sys/tty.rs
+@@ -109,13 +109,13 @@ mod unix {
+ 		(CtlChar::Start, libc::VSTART),
+ 		(CtlChar::Stop, libc::VSTOP),
+ 		(CtlChar::Susp, libc::VSUSP),
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		(CtlChar::Dsusp, libc::VDSUSP),
+ 		(CtlChar::Lnext, libc::VLNEXT),
+ 		(CtlChar::Werase, libc::VWERASE),
+ 		(CtlChar::Reprint, libc::VREPRINT),
+ 		(CtlChar::Discard, libc::VDISCARD),
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		(CtlChar::Status, libc::VSTATUS),
+ 		#[cfg(target_os = "linux")]
+ 		(CtlChar::Swtc, libc::VSWTC),
+diff --git a/crates/vfs/src/fs.rs b/crates/vfs/src/fs.rs
+index 76d67f7289..402b1c8f4c 100644
+--- a/crates/vfs/src/fs.rs
++++ b/crates/vfs/src/fs.rs
+@@ -518,8 +518,13 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
+ 	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+ 		return false;
+ 	};
++	#[cfg(target_os = "android")]
++	// Bionic exposes AT_EACCESS in linux/fcntl.h, but the libc crate omits it.
++	const ACCESS_FLAGS: libc::c_int = 0x200;
++	#[cfg(not(target_os = "android"))]
++	const ACCESS_FLAGS: libc::c_int = libc::AT_EACCESS;
+ 	// SAFETY: `path` is a NUL-terminated string alive for the call.
+-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
++	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, ACCESS_FLAGS) == 0 }
+ }
+ 
+ /// Reads a whole host file. Under a cancellable scope the read goes through
+diff --git a/crates/xfs/src/watch/inotify.rs b/crates/xfs/src/watch/inotify.rs
+index 451dfc7da5..d9401cae5d 100644
+--- a/crates/xfs/src/watch/inotify.rs
++++ b/crates/xfs/src/watch/inotify.rs
+@@ -258,8 +258,9 @@ impl State {
+ 					Some(&next) => next == b'/',
+ 				});
+ 			if gone {
+-				// SAFETY: plain syscall on a live descriptor.
+-				unsafe { libc::inotify_rm_watch(inotify, wd) };
++				// SAFETY: live descriptor; Bionic takes the watch descriptor as
++				// unsigned.
++				unsafe { libc::inotify_rm_watch(inotify, wd as _) };
+ 			}
+ 			!gone
+ 		});
+@@ -368,8 +369,9 @@ impl State {
+ 			// kernel confirms.
+ 			let path = watch.path.clone();
+ 			self.forget_below(&path, false);
+-			// SAFETY: plain syscall on a live descriptor.
+-			unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd) };
++			// SAFETY: live descriptor; Bionic takes the watch descriptor as
++			// unsigned.
++			unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd as _) };
+ 		}
+ 		Ok(())
+ 	}
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index d728cac5bd..e2267f8137 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -16,6 +16,9 @@
+ - Added a portable `column` shell builtin with util-linux-compatible options, including table formatting, named columns, alignment, hiding, ordering, JSON output, tree display, and width controls.
+ - Added extension todo backends through `pi.registerTodoBackend()` and the `todo.backend` setting. Registered backends can mirror the session’s complete todo list to an external store and can be selected and configured from `/settings` → Tools → Todos.
+ - `/wt` now runs the new worktree’s `post-checkout` hook, displays progress in the TUI, and loads skills and commands created by the hook. Failed hooks leave the worktree intact and display a warning.
++- Added `pi.registerTodoBackend()` and the `todo.backend` setting: an extension can mirror the main session's todo list into an external store, which gets the whole list after every change ([#19890](https://github.com/can1357/oh-my-pi/pull/19890) by [@Dangerboi](https://github.com/Dangerboi))
++- Added standalone Android ARM64/Termux executables bundling Bun 1.4.4, with Linux cross-build support.
++- `/wt` (TUI, ACP, RPC and `worktree.onStart`) runs the new worktree's `post-checkout` hook as `git worktree add` does, with a spinner in the TUI, then loads the skills and commands it added; a failing hook keeps the worktree and shows a warning, and quitting while it runs keeps that worktree with a warning. In an ovnfs checkout only a `core.hooksPath` hook runs ([#20045](https://github.com/can1357/oh-my-pi/pull/20045) by [@Dangerboi](https://github.com/Dangerboi))
+ 
+ ### Changed
+ 
+diff --git a/packages/coding-agent/DEVELOPMENT.md b/packages/coding-agent/DEVELOPMENT.md
+index 2f4b1b0b32..f81dfc1a63 100644
+--- a/packages/coding-agent/DEVELOPMENT.md
++++ b/packages/coding-agent/DEVELOPMENT.md
+@@ -22,6 +22,43 @@ Run from `packages/coding-agent/` (or add `--cwd=packages/coding-agent`):
+ | Autofix: lint + format prompts | `bun run fix`         |
+ | Build the `dist/omp` binary    | `bun run build`       |
+ 
++## Optional Android ARM64 standalone binary
++
++From a Linux build host, run:
++
++```sh
++bun --cwd=packages/coding-agent run build:android
++```
++
++Set `ANDROID_NDK_HOME` to Android NDK 25b or newer and use released Bun 1.4.4
++on the Linux build host. The optional Linux cross-build builds the `android-arm64`
++native addon with Bazel, then compiles the CLI for Bun's
++`bun-linux-arm64-android` target. It writes the raw standalone executable to
++`packages/coding-agent/dist/omp-android-arm64`; the Bun runtime is included, so
++Termux does not need a separate Bun installation. The bundled Bun 1.4.4 runtime
++and native addon both target Android 9 (API 28).
++
++To install a published binary from Termux, use:
++
++```sh
++curl -fsSL https://omp.sh/install | sh -s -- --binary
++```
++
++To test a locally built executable, transfer `dist/omp-android-arm64` to the
++device, then install it from Termux:
++
++```sh
++cp /path/to/omp-android-arm64 "$PREFIX/bin/omp"
++chmod 755 "$PREFIX/bin/omp"
++omp --version
++```
++
++`$PREFIX/bin` is already on Termux's `PATH`. Copy the executable into Termux's
++private storage rather than running it from shared Android storage.
++
++Cross-compilation does not verify Android/Termux or seccomp compatibility;
++validate the executable on a native non-root Termux device before publishing.
++
+ Type checks use Bun's built-in checker (`bun check --no-script`); the explicit
+ flag bypasses each package's `check` script. Stable TypeScript is retained only
+ for publishing declarations and JavaScript, which `bun check` does not emit.
+diff --git a/packages/coding-agent/package.json b/packages/coding-agent/package.json
+index d80bbc08c8..664d3b0e53 100644
+--- a/packages/coding-agent/package.json
++++ b/packages/coding-agent/package.json
+@@ -15,7 +15,10 @@
+ 		"url": "https://github.com/can1357/oh-my-pi/issues"
+ 	},
+ 	"license": "MIT",
+-	"author": { "name": "Stencil Labs, Inc.", "url": "https://stencil.so" },
++	"author": {
++		"name": "Stencil Labs, Inc.",
++		"url": "https://stencil.so"
++	},
+ 	"contributors": [
+ 		"Mario Zechner"
+ 	],
+@@ -538,6 +541,7 @@
+ 	},
+ 	"scripts": {
+ 		"build": "bun scripts/build-binary.ts",
++		"build:android": "bun scripts/build-android-binary.ts",
+ 		"check": "oxlint . && oxfmt --check --no-error-on-unmatched-pattern 'src/**/*.{ts,tsx}' '{test,bench,examples,scripts}/**/*.ts' '*.ts' && bun run check:types",
+ 		"check:types": "bun check --no-script -p tsconfig.json",
+ 		"lint": "oxlint .",
+diff --git a/packages/coding-agent/scripts/build-android-binary.ts b/packages/coding-agent/scripts/build-android-binary.ts
+new file mode 100644
+index 0000000000..a6d5535d71
+--- /dev/null
++++ b/packages/coding-agent/scripts/build-android-binary.ts
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bun
++
++import * as fs from "node:fs/promises";
++import * as path from "node:path";
++import { ANDROID_COMPILE_TARGET, compileCodingAgent } from "./compile-binary";
++
++const packageDir = path.join(import.meta.dir, "..");
++const repoRoot = path.join(packageDir, "..", "..");
++
++async function runCommand(command: string[]): Promise<void> {
++	const proc = Bun.spawn(command, {
++		cwd: packageDir,
++		stdout: "inherit",
++		stderr: "inherit",
++	});
++	const exitCode = await proc.exited;
++	if (exitCode !== 0) {
++		throw new Error(`Command failed with exit code ${exitCode}: ${command.join(" ")}`);
++	}
++}
++
++async function buildAndroidBinary(): Promise<void> {
++	if (process.platform !== "linux") {
++		throw new Error("Android cross-build requires a Linux build host");
++	}
++
++	const outputPath = path.join(packageDir, "dist", "omp-android-arm64");
++	await runCommand(["bun", "../../scripts/bazel-natives.ts", "android-arm64", "--dest", "../natives/native"]);
++	try {
++		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
++		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:export-viewer"]);
++		await fs.mkdir(path.dirname(outputPath), { recursive: true });
++		await compileCodingAgent({
++			repoRoot,
++			entrypoint: path.join(packageDir, "src", "cli.ts"),
++			outfile: outputPath,
++			native: { platform: "android", arch: "arm64" },
++			target: ANDROID_COMPILE_TARGET,
++		});
++	} finally {
++		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
++	}
++}
++
++if (import.meta.main) await buildAndroidBinary();
+diff --git a/packages/coding-agent/scripts/build-binary.ts b/packages/coding-agent/scripts/build-binary.ts
+index 57c54cb6f1..d0e28ad39d 100644
+--- a/packages/coding-agent/scripts/build-binary.ts
++++ b/packages/coding-agent/scripts/build-binary.ts
+@@ -87,6 +87,7 @@ async function main(): Promise<void> {
+ 				outputPath,
+ 			]);
+ 		}
++
+ 	} finally {
+ 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
+ 	}
+diff --git a/packages/coding-agent/scripts/bundle-dist.ts b/packages/coding-agent/scripts/bundle-dist.ts
+index f14f637ca0..1e6eb51ec4 100755
+--- a/packages/coding-agent/scripts/bundle-dist.ts
++++ b/packages/coding-agent/scripts/bundle-dist.ts
+@@ -2,21 +2,23 @@
+ 
+ import * as fs from "node:fs/promises";
+ import * as path from "node:path";
+-import { isEnoent } from "@oh-my-pi/pi-utils";
++import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+ import { embeddedRelayExtensionFiles } from "./embed-relay-extension";
+ import { buildDocsIndexPayload } from "./generate-docs-index";
+ import { createJsonParsePlugin } from "./json-parse-plugin";
+ import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
+ 
+ const packageDir = path.join(import.meta.dir, "..");
+-const defaultOutDir = path.join(packageDir, "dist");
++const configuredOutDir = Bun.env.OMP_BUNDLE_OUTDIR;
++const defaultOutDir = configuredOutDir ? path.resolve(configuredOutDir) : path.join(packageDir, "dist");
+ const shebang = "#!/usr/bin/env bun\n";
+ // Remove old inline-viewer sidecars left in an existing output directory.
+ const obsoleteHtmlExportAssetPattern =
+ 	/^(?:template-[^.]+\.(?:css|html|js)|tool-views\.generated-[^.]+\.js|(?:marked|highlight)\.min-[^.]+\.js)$/;
+ 
+-// Native/platform dependencies and on-demand model runtimes stay outside the bundle.
++// Native and optional dependencies load from installed files in desktop npm bundles.
+ const ALWAYS_EXTERNAL = ["@oh-my-pi/pi-natives", "@huggingface/transformers", "fastembed", "onnxruntime-node"];
++const RUNTIME_EXTERNAL = ["puppeteer-core", "@babel/parser"];
+ 
+ /**
+  * Embeds `@oh-my-pi/pi-natives/THIRD-PARTY-NOTICES.txt` even though the natives package is external. An external
+@@ -39,7 +41,6 @@ const inlineNativeNoticesPlugin: Bun.BunPlugin = {
+ // import would load the unpatched npm package in users' installs (currently
+ // @ark/schema is patched, so it — and arktype, which pulls @ark/schema — stay
+ // bundled).
+-const RUNTIME_EXTERNAL = ["puppeteer-core", "@babel/parser"];
+ 
+ async function runCommand(command: string[]): Promise<void> {
+ 	const proc = Bun.spawn(command, {
+@@ -79,6 +80,8 @@ async function cleanBundleOutputs(outDir: string): Promise<void> {
+ 				entry =>
+ 					entry === "cli.js" ||
+ 					entry === "docs-index.generated.txt" ||
++					entry === "embedded-addon.js" ||
++					(entry.startsWith("embedded-addons.") && entry.endsWith(".tar.gz")) ||
+ 					entry.endsWith(".node") ||
+ 					entry.endsWith(".js.map") ||
+ 					/\.json-[^/]+\.zst$/.test(entry) ||
+@@ -99,10 +102,10 @@ export async function bundleDist(outDir: string = defaultOutDir): Promise<void>
+ 	// archive the same way compiled binaries do (scripts/build-binary.ts). Reset
+ 	// afterwards to keep the checked-in placeholder empty.
+ 	await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+-	// One payload for both consumers: inlined into dist/cli.js via `--define` for
+-	// the bundled CLI entrypoint, and written to dist/docs-index.generated.txt so
+-	// SDK consumers importing `@oh-my-pi/pi-coding-agent/*` (TypeScript source, no
+-	// build-time embed) can still resolve omp:// docs (see src/internal-urls/docs-index.ts).
++	// One payload for both consumers: inlined into the bundled CLI entrypoint,
++	// and written to dist/docs-index.generated.txt so SDK consumers importing
++	// @oh-my-pi/pi-coding-agent/* (TypeScript source, no build-time embed) can
++	// still resolve omp:// docs (see src/internal-urls/docs-index.ts).
+ 	try {
+ 		const docsPayload = await buildDocsIndexPayload();
+ 		// Build in-process: the docs embed payload is far larger than Linux's
+diff --git a/packages/coding-agent/scripts/compile-binary.ts b/packages/coding-agent/scripts/compile-binary.ts
+index 38d17864fd..a763210489 100644
+--- a/packages/coding-agent/scripts/compile-binary.ts
++++ b/packages/coding-agent/scripts/compile-binary.ts
+@@ -14,6 +14,19 @@ export const COMPILED_EXTERNAL_DEPENDENCIES: readonly string[] = Object.freeze([
+ 	"onnxruntime-node",
+ ]);
+ 
++/** Bun 1.4.4 supports Android cross-compilation; the installed Bun types lag this target. */
++export const ANDROID_COMPILE_TARGET = "bun-linux-arm64-android";
++
++/**
++ * Compile targets accepted by the shared coding-agent builder. Current Bun
++ * declarations omit its Android target and the existing musl-baseline release
++ * target spelling.
++ */
++export type CodingAgentCompileTarget =
++	| Bun.Build.CompileTarget
++	| typeof ANDROID_COMPILE_TARGET
++	| "bun-linux-x64-musl-baseline";
++
+ /** Inputs shared by local and release coding-agent binary builds. */
+ export interface CodingAgentCompileOptions {
+ 	/** Absolute repository root used for package resolution. */
+@@ -28,7 +41,7 @@ export interface CodingAgentCompileOptions {
+ 	 */
+ 	readonly native: NativeEmbedTarget | null;
+ 	/** Optional cross-compilation runtime target. */
+-	readonly target?: Bun.Build.CompileTarget;
++	readonly target?: CodingAgentCompileTarget;
+ 	/** Optional unmodified Bun executable used as the standalone runtime template. */
+ 	readonly executablePath?: string;
+ 	/** Match release builds that minify identifiers while retaining names. */
+@@ -79,7 +92,7 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
+ 				...(options.executablePath
+ 					? { executablePath: options.executablePath }
+ 					: options.target
+-						? { target: options.target }
++						? { target: options.target as Bun.Build.CompileTarget }
+ 						: {}),
+ 				outfile: options.outfile,
+ 				autoloadBunfig: false,
+diff --git a/packages/coding-agent/scripts/omp b/packages/coding-agent/scripts/omp
+index 3fe00535f5..28fea04048 100755
+--- a/packages/coding-agent/scripts/omp
++++ b/packages/coding-agent/scripts/omp
+@@ -1,12 +1,12 @@
+ #!/bin/sh
+-# Dev launcher for the omp CLI, installed by `bun run setup`.
++# Shell launcher for the omp source CLI.
+ #
+-# Problem it solves: Bun reads `bunfig.toml` from the *current working
+-# directory* at startup and evaluates its `preload` entries before running the
+-# script. A bun-shebang bin (what `bun link` creates for `src/cli.ts`)
+-# therefore inherits whatever `preload` the directory you happen to be in
+-# declares. Running `omp`/`pi` inside an unrelated Bun project can execute — and
+-# crash on — that project's preload, e.g.
++# Bun reads `bunfig.toml` from the *current working directory* at startup and
++# evaluates its `preload` entries before running the script. A bun-shebang bin
++# (what `bun link` creates for `src/cli.ts`) therefore inherits whatever
++# `preload` the directory you happen to be in. Running `omp`/`pi` inside an
++# unrelated Bun project can execute — and crash on — that project's preload,
++# e.g.
+ #   error: Cannot find module '@v12sh/utils/frontmatter' from '.../loader.ts'
+ #
+ # Bun only reads the *exact* cwd (it does not walk parents) and ignores
+@@ -26,10 +26,25 @@ while [ -L "$self" ]; do
+ 	esac
+ done
+ scripts_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
++
++# Source launchers live in scripts/ beside omp.ts and point at src/cli.ts.
+ cli=$scripts_dir/../src/cli.ts
+ preload=$scripts_dir/omp.ts
+ timing_preload=$scripts_dir/../../utils/src/module-timer.ts
+ 
++if [ ! -r "$cli" ]; then
++	echo "omp: missing CLI entrypoint: $cli" >&2
++	exit 127
++fi
++if [ ! -r "$preload" ]; then
++	echo "omp: missing launch preload: $preload" >&2
++	exit 127
++fi
++if [ -n "${PI_TIMING:-}" ] && [ ! -r "$timing_preload" ]; then
++	echo "omp: missing timing preload: $timing_preload" >&2
++	exit 127
++fi
++
+ launch_dir=${OMP_DEV_LAUNCH_DIR:-${HOME}/.omp/.dev-cwd}
+ [ -d "$launch_dir" ] || mkdir -p "$launch_dir"
+ 
+@@ -37,7 +52,7 @@ OMP_LAUNCH_CWD=$PWD
+ export OMP_LAUNCH_CWD
+ cd "$launch_dir"
+ # Herdr 0.7.5 validates the foreground process name. The macOS shell can
+-# preserve OMP's identity while still running the development CLI through Bun.
++# preserve OMP's identity while still running the CLI through Bun.
+ run_bun() {
+ 	if [ "${HERDR_ENV:-}" = 1 ] && [ "$(uname -s)" = Darwin ]; then
+ 		exec -a omp bun "$@"
+diff --git a/packages/coding-agent/src/cli/build-service.ts b/packages/coding-agent/src/cli/build-service.ts
+index 7664a8522f..b9bdb09120 100644
+--- a/packages/coding-agent/src/cli/build-service.ts
++++ b/packages/coding-agent/src/cli/build-service.ts
+@@ -13,8 +13,9 @@
+  *   exact version.
+  *
+  * Both products are public, so no token is sent. The origin is `PI_BUILD_URL`
+- * ({@link DEFAULT_BUILD_URL} when unset). `{target}` is
+- * `{macos|linux|linux-musl|windows}-{arm64|x86_64}` ({@link resolveBuildHost}).
++ * ({@link DEFAULT_BUILD_URL} when unset). Targets are
++ * `{macos|linux|linux-musl|windows}-{arm64|x86_64}` or `android-arm64`
++ * ({@link resolveBuildHost}).
+  * Requests carry `User-Agent: omp/<version>`, which the service counts in its
+  * update-check statistics.
+  *
+@@ -60,7 +61,7 @@ export function buildServiceUrl(): string {
+ 
+ /** Where this host's builds live on the build service. */
+ export interface BuildHost {
+-	/** Build service target, e.g. `macos-arm64` or `linux-musl-x86_64`. */
++	/** Build service target, e.g. `macos-arm64`, `linux-musl-x86_64`, or `android-arm64`. */
+ 	target: string;
+ 	/** Platform part of release file names, e.g. `darwin-arm64` or `linux-musl-x64`. */
+ 	asset: string;
+@@ -91,6 +92,10 @@ export function resolveBuildHost(platform: NodeJS.Platform, arch: string, musl:
+ 			targetOs = "macos";
+ 			fileOs = "darwin";
+ 			break;
++		case "android":
++			targetOs = "android";
++			fileOs = "android";
++			break;
+ 		case "linux":
+ 			targetOs = musl ? "linux-musl" : "linux";
+ 			fileOs = targetOs;
+@@ -102,6 +107,9 @@ export function resolveBuildHost(platform: NodeJS.Platform, arch: string, musl:
+ 		default:
+ 			throw new Error(`Unsupported platform: ${platform}`);
+ 	}
++	if (platform === "android" && arch !== "arm64") {
++		throw new Error(`Unsupported architecture: ${arch} on Android (only arm64 is supported)`);
++	}
+ 	let targetArch: string;
+ 	switch (arch) {
+ 		case "x64":
+diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
+index d47389e512..b744ca4fd0 100644
+--- a/packages/coding-agent/src/utils/clipboard.ts
++++ b/packages/coding-agent/src/utils/clipboard.ts
+@@ -121,7 +121,7 @@ let macClipboardWrite = Promise.resolve();
+  *
+  * Emits OSC 52 first when running in a real terminal (works over SSH/mosh),
+  * then attempts native clipboard copy as best-effort for local sessions.
+- * On Termux, tries `termux-clipboard-set` before native.
++ * On Termux, only the bounded asynchronous `termux-clipboard-set` path runs.
+  *
+  * The OSC 52 goes through `writeTerminalSequence`, so it cannot tear a TUI
+  * frame; from a worker thread it is skipped and only the native copy runs.
+@@ -141,16 +141,14 @@ export async function copyToClipboard(text: string): Promise<void> {
+ 		await previousWrite;
+ 	}
+ 
+-	// Also try native tools (best effort for local sessions)
++	// Use a local clipboard path after OSC 52. Android only has the Termux
++	// helper; without it, OSC 52 is the only available copy route.
+ 	try {
+ 		if (process.env.TERMUX_VERSION) {
+-			try {
+-				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
+-				return;
+-			} catch {
+-				// Fall through to native
+-			}
++			await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
++			return;
+ 		}
++		if (process.platform === "android") return;
+ 		// macOS: prefer `pbcopy` over the in-process AppKit write, mirroring the
+ 		// read path which already shells out to `pbpaste`. An in-process
+ 		// NSPasteboard write logs
+@@ -318,18 +316,18 @@ async function readTextFromX11Clipboard(): Promise<string> {
+ /**
+  * Read an image from the system clipboard.
+  *
+- * Returns null on Termux (no image clipboard support) or when no display
+- * server is available (headless/SSH without forwarding). Native Windows trusts
+- * the native reader's "no image" answer — it returns null only when no bitmap
+- * format is on the clipboard, and throws when one is present but undecodable —
+- * so `powershell.exe` starts only after a throw and a text-only clipboard never
+- * waits on a cold PowerShell start. WSL reaches the host clipboard through
+- * `powershell.exe`.
++ * Returns null on Android or Termux (no image clipboard support) or when no
++ * display server is available (headless/SSH without forwarding). Native Windows
++ * trusts the native reader's "no image" answer — it returns null only when no
++ * bitmap format is on the clipboard, and throws when one is present but
++ * undecodable — so `powershell.exe` starts only after a throw and a text-only
++ * clipboard never waits on a cold PowerShell start. WSL reaches the host
++ * clipboard through `powershell.exe`.
+  *
+  * @returns A supported image payload or null when no image is available.
+  */
+ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
+-	if (process.env.TERMUX_VERSION) {
++	if (process.platform === "android" || process.env.TERMUX_VERSION) {
+ 		return null;
+ 	}
+ 
+@@ -389,6 +387,9 @@ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
+ export async function readTextFromClipboard(): Promise<string> {
+ 	try {
+ 		const p = process.platform;
++		if (p === "android") {
++			return process.env.TERMUX_VERSION ? await spawnCapture(["termux-clipboard-get"]) : "";
++		}
+ 		if (p === "darwin") {
+ 			return await spawnCapture(["pbpaste"]);
+ 		}
+diff --git a/packages/coding-agent/test/cli/build-service.test.ts b/packages/coding-agent/test/cli/build-service.test.ts
+index bc85119a9c..583ef91e65 100644
+--- a/packages/coding-agent/test/cli/build-service.test.ts
++++ b/packages/coding-agent/test/cli/build-service.test.ts
+@@ -83,6 +83,8 @@ describe("build service targets", () => {
+ 		expect(resolve("linux", "x64", true)).toEqual({ target: "linux-musl-x86_64", fileName: "omp-linux-musl-x64" });
+ 		expect(resolve("linux", "arm64", false)).toEqual({ target: "linux-arm64", fileName: "omp-linux-arm64" });
+ 		expect(resolve("win32", "x64", false)).toEqual({ target: "windows-x86_64", fileName: "omp-windows-x64.exe" });
++		expect(resolve("android", "arm64", false)).toEqual({ target: "android-arm64", fileName: "omp-android-arm64" });
++		expect(() => resolveBuildHost("android", "x64", false)).toThrow("only arm64 is supported");
+ 	});
+ 
+ 	it("does not mistake an installed musl loader for a glibc host", () => {
+@@ -161,13 +163,53 @@ describe("fetchBuild", () => {
+ 		expect(url).toBe("https://build.stencil.so/api/products/omp/versions/18.8.9/macos-arm64");
+ 	});
+ 
+-	it("names the target when nothing is published for it", async () => {
++	it("rejects when no build is published", async () => {
+ 		await expect(
+ 			fetchBuild(
+ 				{ channel: "stable" },
+ 				{ host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
+ 			),
+-		).rejects.toThrow("No omp stable build for macos-arm64 is published");
++		).rejects.toThrow();
++	});
++
++	it("uses Android's current host for update requests and the Android artifact", async () => {
++		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
++		const archDescriptor = Object.getOwnPropertyDescriptor(process, "arch");
++		if (!platformDescriptor || !archDescriptor) throw new Error("process platform or arch descriptor is unavailable");
++		const requests: string[] = [];
++
++		try {
++			Object.defineProperty(process, "platform", { ...platformDescriptor, value: "android" });
++			Object.defineProperty(process, "arch", { ...archDescriptor, value: "arm64" });
++			process.env.PI_BUILD_URL = "https://build.test";
++			const build = await fetchBuild(
++				{ channel: "stable" },
++				{
++					fetchImpl: async input => {
++						requests.push(String(input));
++						return Response.json(
++							answer({
++								file: {
++									name: "omp-android-arm64",
++									platform: "android",
++									arch: "arm64",
++									kind: "binary",
++									size: 3,
++									sha256: sha("android"),
++								},
++								download: "https://r2.test/omp-android-arm64",
++							}),
++						);
++					},
++				},
++			);
++
++			expect(requests).toEqual(["https://build.test/api/products/omp/latest/android-arm64?channel=stable"]);
++			expect(build.file.name).toBe("omp-android-arm64");
++		} finally {
++			Object.defineProperty(process, "platform", platformDescriptor);
++			Object.defineProperty(process, "arch", archDescriptor);
++		}
+ 	});
+ });
+ 
+diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/coding-agent/test/utils/clipboard.test.ts
+index 581c2bf3cb..c261968433 100644
+--- a/packages/coding-agent/test/utils/clipboard.test.ts
++++ b/packages/coding-agent/test/utils/clipboard.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import {
++	copyToClipboard,
+ 	isClipboardTerminalLocal,
+ 	readImageFromClipboard,
+ 	readMacFileUrlsFromClipboard,
+@@ -85,6 +86,48 @@ afterEach(() => {
+ const RED_1X1_PNG_BASE64 =
+ 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+ 
++describe("copyToClipboard on Termux", () => {
++	it("does not invoke the native fallback when the Termux helper fails", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		const calls: SpawnCall[] = [];
++		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
++		spySpawn(calls, "", 1);
++		const nativeSpy = vi.spyOn(native, "copyToClipboard");
++
++		await copyToClipboard("hello");
++
++		expect(calls).toHaveLength(1);
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-set"]);
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
++	it("uses the Termux helper on Android when available", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "");
++		const nativeSpy = vi.spyOn(native, "copyToClipboard");
++
++		await copyToClipboard("hello");
++
++		expect(calls).toHaveLength(1);
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-set"]);
++		expect(calls[0]?.options.stdin).toEqual(Buffer.from("hello"));
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
++
++	it("does not use native clipboard or desktop tools on Android without Termux", async () => {
++		setPlatform("android");
++		const spawnSpy = vi.spyOn(Bun, "spawn");
++		const nativeSpy = vi.spyOn(native, "copyToClipboard");
++
++		await copyToClipboard("hello");
++
++		expect(spawnSpy).not.toHaveBeenCalled();
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
++});
++
+ describe("readImageFromClipboard on WSL", () => {
+ 	it("decodes the PowerShell base64 payload without touching the native bridge", async () => {
+ 		setPlatform("linux");
+@@ -231,6 +274,19 @@ describe("readImageFromClipboard dispatch", () => {
+ 		},
+ 	);
+ 
++	it("returns no image on Android without invoking native or desktop clipboard paths", async () => {
++		setPlatform("android");
++		process.env.WSL_INTEROP = "/run/WSL/1_interop";
++		process.env.WSL_DISTRO_NAME = "Ubuntu";
++		process.env.DISPLAY = ":0";
++		process.env.WAYLAND_DISPLAY = "wayland-0";
++		const spawnSpy = vi.spyOn(Bun, "spawn");
++		const nativeSpy = vi.spyOn(native, "readImageFromClipboard");
++
++		expect(await readImageFromClipboard()).toBeNull();
++		expect(spawnSpy).not.toHaveBeenCalled();
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
+ 	it("returns null on Termux without spawning anything", async () => {
+ 		setPlatform("linux");
+ 		process.env.TERMUX_VERSION = "0.118";
+@@ -279,6 +335,31 @@ describe("readMacFileUrlsFromClipboard", () => {
+ });
+ 
+ describe("readTextFromClipboard", () => {
++	it("returns no text on Android without Termux or desktop/native clipboard access", async () => {
++		setPlatform("android");
++		process.env.WSL_INTEROP = "/run/WSL/1_interop";
++		process.env.WSL_DISTRO_NAME = "Ubuntu";
++		process.env.DISPLAY = ":0";
++		process.env.WAYLAND_DISPLAY = "wayland-0";
++		const spawnSpy = vi.spyOn(Bun, "spawn");
++		const nativeSpy = vi.spyOn(native, "readTextFromClipboard");
++
++		expect(await readTextFromClipboard()).toBe("");
++		expect(spawnSpy).not.toHaveBeenCalled();
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
++
++	it("reads Android text through termux-clipboard-get", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "from Termux");
++		const nativeSpy = vi.spyOn(native, "readTextFromClipboard");
++
++		expect(await readTextFromClipboard()).toBe("from Termux");
++		expect(calls.map(call => call.cmd)).toEqual([["termux-clipboard-get"]]);
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
+ 	it("falls back to xsel when xclip is unavailable on X11", async () => {
+ 		setPlatform("linux");
+ 		process.env.DISPLAY = ":0";
+diff --git a/packages/natives/CHANGELOG.md b/packages/natives/CHANGELOG.md
+index 91a8897e2e..e798507214 100644
+--- a/packages/natives/CHANGELOG.md
++++ b/packages/natives/CHANGELOG.md
+@@ -3,6 +3,18 @@
+ ## [Unreleased]
+ 
+ ## [19.1.1] - 2026-11-23
++### Added
++
++- Added an explicit Android ARM64 native cross-build using the Android NDK (API level 28) for standalone Termux binaries.
++
++### Changed
++
++- Added Android ARM64/Bionic process-management support.
++- Android desktop sessions now report `Unsupported`; desktop capture and input remain unavailable.
++
++### Fixed
++
++- Android native-load failures now report attempted addon paths and rebuild guidance instead of incorrectly reporting an unsupported platform.
+ 
+ ### Fixed
+ 
+diff --git a/packages/natives/README.md b/packages/natives/README.md
+index ac44aace76..559242a809 100644
+--- a/packages/natives/README.md
++++ b/packages/natives/README.md
+@@ -83,6 +83,51 @@ bun run build
+ bun run check
+ ```
+ 
++Android ARM64 has an explicit experimental Bazel cross-target for the native
++addon; it is not part of the `all` native aggregate. From a Linux host with
++Bazel and Android NDK 25b or newer, build just the addon from the workspace
++root:
++
++```sh
++ANDROID_NDK_HOME=/path/to/android-ndk bun scripts/bazel-natives.ts android-arm64
++```
++
++The installer targets Android 9 (API 28) and installs
++`packages/natives/native/pi_natives.android-arm64.node`. It only load-probes
++artifacts native to the current host, so a Linux builder never loads Android.
++
++To cross-build a standalone coding-agent Android binary, use the optional Linux-host command:
++
++```sh
++ANDROID_NDK_HOME=/path/to/android-ndk bun --cwd=packages/coding-agent run build:android
++```
++
++Use Android NDK 25b or newer and released Bun 1.4.4 on the Linux build host.
++The command builds the explicit Bazel `android-arm64` native target, then
++compiles the CLI for Bun's `bun-linux-arm64-android` target. The raw executable
++is written to `packages/coding-agent/dist/omp-android-arm64`; Bun's runtime is
++included, so it does not need an external Bun installation in Termux.
++The bundled Bun 1.4.4 runtime and native addon both target Android 9 (API 28).
++The generic `build` and `CROSS_TARGET` paths remain for ordinary
++host/cross-target builds.
++
++Install a published binary from Termux with:
++
++```sh
++curl -fsSL https://omp.sh/install | sh -s -- --binary
++```
++
++Cross-compilation does not verify Android/Termux or seccomp compatibility;
++validate the executable on a native non-root Termux device before publishing.
++
++The Android addon omits the native desktop and clipboard modules. The desktop
++declarations remain available for type compatibility, but Android does not
++provide desktop sessions. The package root and
++`@oh-my-pi/pi-natives/desktop` can both be imported; calling
++`createDesktopSession()` from the subpath throws
++`Unsupported: desktop sessions are not supported on this platform.` No Android
++screen-capture or input support is provided.
++
+ ## Architecture
+ 
+ `@oh-my-pi/pi-natives` publishes a small core package plus generated
+diff --git a/packages/natives/native/desktop-adapter.d.ts b/packages/natives/native/desktop-adapter.d.ts
+index 2c8ede2e85..8bac401f40 100644
+--- a/packages/natives/native/desktop-adapter.d.ts
++++ b/packages/natives/native/desktop-adapter.d.ts
+@@ -1,4 +1,9 @@
+ import type { DesktopSession } from "./index.js";
+ 
+-/** Return the current native ABI, or a constructor that rejects an outdated addon on first desktop use. */
+-export function adaptDesktopSession(NativeDesktopSession: unknown): typeof DesktopSession;
++type NativeDesktopClass = typeof DesktopSession;
++type NativeDesktopConstructor = new (...args: never[]) => unknown;
++
++/** Reject stale native ABIs on first desktop use without unsafe fallbacks. */
++export function adaptDesktopSession(NativeDesktopSession: NativeDesktopConstructor): NativeDesktopClass;
++export function adaptDesktopSession(NativeDesktopSession: undefined): undefined;
++export function adaptDesktopSession(NativeDesktopSession: NativeDesktopConstructor | undefined): NativeDesktopClass | undefined;
+diff --git a/packages/natives/native/desktop-adapter.js b/packages/natives/native/desktop-adapter.js
+index 8e8200f136..68351cbccf 100644
+--- a/packages/natives/native/desktop-adapter.js
++++ b/packages/natives/native/desktop-adapter.js
+@@ -24,8 +24,11 @@ const REQUIRED_METHODS = [
+ /** Getters the computer worker reads; without `escapeStops` it would read every run as stopped by the user's Escape. */
+ const REQUIRED_GETTERS = ["escapeStops"];
+ 
+-/** Require the current desktop ABI; partial legacy emulation cannot preserve input ownership. */
++/** Reject incomplete native ABIs on first desktop use without unsafe fallbacks. */
+ export function adaptDesktopSession(NativeDesktopSession) {
++	if (NativeDesktopSession === undefined) {
++		return undefined;
++	}
+ 	const prototype = NativeDesktopSession?.prototype;
+ 	const missing = [
+ 		...REQUIRED_METHODS.filter(method => typeof prototype?.[method] !== "function"),
+diff --git a/packages/natives/native/desktop.js b/packages/natives/native/desktop.js
+index 3ec071b3ad..4fb7c2e6e2 100644
+--- a/packages/natives/native/desktop.js
++++ b/packages/natives/native/desktop.js
+@@ -8,7 +8,13 @@ let DesktopSession;
+  * computer worker receives its initialization message.
+  */
+ export function createDesktopSession(options) {
+-	DesktopSession ??= adaptDesktopSession(loadNative().DesktopSession);
++	if (DesktopSession === undefined) {
++		const NativeDesktopSession = loadNative().DesktopSession;
++		if (NativeDesktopSession === undefined) {
++			throw new Error("Unsupported: desktop sessions are not supported on this platform.");
++		}
++		DesktopSession = adaptDesktopSession(NativeDesktopSession);
++	}
+ 	return new DesktopSession(options);
+ }
+ 
+diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
+index 3c5535ad71..96c40e2095 100644
+--- a/packages/natives/native/loader-state.js
++++ b/packages/natives/native/loader-state.js
+@@ -32,6 +32,7 @@ import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionSta
+  */
+ 
+ const SUPPORTED_PLATFORMS = [
++	"android-arm64",
+ 	"linux-x64",
+ 	"linux-arm64",
+ 	"darwin-x64",
+diff --git a/packages/natives/scripts/build-bindings.ts b/packages/natives/scripts/build-bindings.ts
+index 1b4803a4f0..70e92ef067 100644
+--- a/packages/natives/scripts/build-bindings.ts
++++ b/packages/natives/scripts/build-bindings.ts
+@@ -59,6 +59,62 @@ const repoRoot = path.join(import.meta.dir, "../../..");
+ const rustDir = path.join(repoRoot, "crates/natives");
+ const nativeDir = path.join(import.meta.dir, "../native");
+ const packageJsonPath = path.join(import.meta.dir, "../package.json");
++// napi-rs omits desktop and clipboard modules guarded out for the target.
++// Keep their platform-neutral root declarations and referenced-type closure so
++// generated declarations and ESM exports retain the package's public shape.
++const PLATFORM_NEUTRAL_BINDING_NAMES: Record<string, true> = {
++	DesktopSession: true,
++	ClipboardImage: true,
++	copyToClipboard: true,
++	readImageFromClipboard: true,
++	readTextFromClipboard: true,
++};
++
++const DECLARATION_START_RE = /^export (?:declare )?(?:class|function|(?:const )?enum|interface|type)\s+(\w+)/;
++
++function declarationBlocks(dts: string): Map<string, string> {
++	const lines = dts.split("\n");
++	const starts: Array<{ name: string; line: number }> = [];
++	for (let line = 0; line < lines.length; line++) {
++		const match = DECLARATION_START_RE.exec(lines[line]!);
++		if (match !== null) starts.push({ name: match[1]!, line });
++	}
++
++	const blocks = new Map<string, string>();
++	for (let index = 0; index < starts.length; index++) {
++		const current = starts[index]!;
++		const nextLine = starts[index + 1]?.line ?? lines.length;
++		blocks.set(current.name, lines.slice(current.line, nextLine).join("\n").trim());
++	}
++	return blocks;
++}
++
++function preservePlatformNeutralDeclarations(generated: string, existing: string): string {
++	const generatedBlocks = declarationBlocks(generated);
++	const existingBlocks = declarationBlocks(existing);
++	// Preserve each platform-neutral entry's full referenced-type closure, not only its root signature.
++	const preservedNames = new Set(
++		Object.keys(PLATFORM_NEUTRAL_BINDING_NAMES).filter(
++			name => existingBlocks.has(name) && !generatedBlocks.has(name),
++		),
++	);
++	const pending = [...preservedNames];
++	while (pending.length > 0) {
++		const block = existingBlocks.get(pending.pop()!)!;
++		const source = block.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
++		for (const match of source.matchAll(/\b[A-Za-z_$][\w$]*\b/g)) {
++			const name = match[0]!;
++			if (generatedBlocks.has(name) || preservedNames.has(name) || !existingBlocks.has(name)) continue;
++			preservedNames.add(name);
++			pending.push(name);
++		}
++	}
++	const preserved = [...existingBlocks.entries()]
++		.filter(([name]) => preservedNames.has(name))
++		.map(([, block]) => block);
++	if (preserved.length === 0) return generated;
++	return `${generated.trimEnd()}\n\n${preserved.join("\n\n")}\n`;
++}
+ 
+ const localAddon = resolveLocalHostAddon({
+ 	platform: process.platform,
+@@ -168,7 +224,11 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
+ 	const sourcePath = path.join(outputDir, "index.d.ts");
+ 	const destPath = path.join(nativeDir, "index.d.ts");
+ 	try {
+-		await fs.copyFile(sourcePath, destPath);
++		const generated = await fs.readFile(sourcePath, "utf8");
++		const existing = await fs
++			.readFile(destPath, "utf8")
++			.catch(err => ((err as NodeJS.ErrnoException).code === "ENOENT" ? "" : Promise.reject(err)));
++		await fs.writeFile(destPath, preservePlatformNeutralDeclarations(generated, existing));
+ 	} catch (err) {
+ 		const message = err instanceof Error ? err.message : String(err);
+ 		throw new Error(`Failed to install generated index.d.ts: ${message}`);
+diff --git a/packages/natives/test/addon-load-verification.test.ts b/packages/natives/test/addon-load-verification.test.ts
+index f3a4f03a50..d7dfe5e553 100644
+--- a/packages/natives/test/addon-load-verification.test.ts
++++ b/packages/natives/test/addon-load-verification.test.ts
+@@ -23,6 +23,7 @@ import {
+ 	type HostInfo,
+ 	hostProbeFilename,
+ 	resolveTargetMembers,
++	targetToolchainArgs,
+ 	verifyHostAddonLoads,
+ } from "../../../scripts/bazel-natives";
+ import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
+@@ -150,6 +151,14 @@ describe("hostProbeFilename", () => {
+ 		expect(hostProbeFilename(["win32-x64-baseline"], windowsArm64)).toBeNull();
+ 	});
+ 
++	test("a Termux ARM64 host resolves and probes only the Android addon", () => {
++		const termuxArm64: HostInfo = { platform: "android", arch: "arm64", avx2: false, musl: false };
++		expect(resolveTargetMembers(["host"], termuxArm64)).toEqual(["android-arm64"]);
++		expect(hostProbeFilename(["android-arm64"], termuxArm64)).toBe("pi_natives.android-arm64.node");
++		// An Android artifact is foreign on Linux even when the CPU architecture matches.
++		expect(hostProbeFilename(["android-arm64"], glibcArm64)).toBeNull();
++	});
++
+ 	test("probes the host's own target, however it was requested", () => {
+ 		expect(hostProbeFilename(["linux-arm64"], glibcArm64)).toBe("pi_natives.linux-arm64.node");
+ 		expect(hostProbeFilename(["host"], glibcArm64)).toBe("pi_natives.linux-arm64.node");
+@@ -162,3 +171,16 @@ describe("hostProbeFilename", () => {
+ 		expect(hostProbeFilename(["linux-x64-modern"], glibcX64Baseline)).toBeNull();
+ 	});
+ });
++
++describe("targetToolchainArgs", () => {
++	const linuxX64: HostInfo = { platform: "linux", arch: "x64", avx2: false, musl: false };
++	const termuxArm64: HostInfo = { platform: "android", arch: "arm64", avx2: false, musl: false };
++	const ndkToolchainArg = "--extra_toolchains=@androidndk//:all";
++
++	test("adds the NDK toolchain argument only for Android targets", () => {
++		expect(targetToolchainArgs(["android-arm64"], linuxX64)).toEqual([ndkToolchainArg]);
++		expect(targetToolchainArgs(["host"], termuxArm64)).toEqual([ndkToolchainArg]);
++		expect(targetToolchainArgs(["linux-x64-baseline"], linuxX64)).toEqual([]);
++		expect(targetToolchainArgs(["all"], linuxX64)).toEqual([]);
++	});
++});
+diff --git a/packages/natives/test/desktop-adapter.test.ts b/packages/natives/test/desktop-adapter.test.ts
+index 35c3505b3b..e8711e0a4d 100644
+--- a/packages/natives/test/desktop-adapter.test.ts
++++ b/packages/natives/test/desktop-adapter.test.ts
+@@ -4,32 +4,14 @@ import { desktopEscapeStops, forgetDesktopEscapeStops } from "../native/desktop.
+ import * as loaderState from "../native/loader-state.js";
+ 
+ describe("desktop native ABI requirements", () => {
+-	it.each([
+-		["missing desktop export", undefined],
+-		[
+-			"legacy execute ABI",
+-			class {
+-				execute() {}
+-			},
+-		],
+-		[
+-			"pre-zoom ABI",
+-			class {
+-				click() {}
+-				cancel() {}
+-			},
+-		],
+-		[
+-			"uncancellable ABI",
+-			class {
+-				click() {}
+-				captureRegion() {}
+-			},
+-		],
+-	])("defers rejection of %s until desktop use without constructing the addon", (_label, NativeSession) => {
+-		// Importing the shared native module must remain safe for non-desktop tools.
++	it("rejects a present class with an incomplete ABI when constructing a desktop session", () => {
++		class NativeSession {
++			click() {}
++		}
+ 		const DesktopSession = adaptDesktopSession(NativeSession);
+-		expect(() => new DesktopSession({ display: "active" })).toThrow(/^Unsupported:/);
++		expect(() => new DesktopSession({ display: "active" })).toThrow(
++			/^Unsupported: desktop native addon is outdated \(missing capture,/,
++		);
+ 	});
+ 
+ 	it("rejects an addon built before the turn-scoped display hold", () => {
+@@ -38,19 +20,26 @@ describe("desktop native ABI requirements", () => {
+ 	});
+ 
+ 	it("rejects an addon built before the Escape stop count", () => {
+-		// Every method present, so only the getter can decide; without it the worker reads each run as stopped.
+-		const prototype = (escapeStops: boolean) =>
+-			new Proxy(
+-				{},
+-				{
+-					get: () => () => {},
+-					has: (_target, key) => escapeStops || key !== "escapeStops",
+-				},
+-			);
+-		const Current = { prototype: prototype(true) };
++		// Every method is present, so only the getter decides; without it the worker reads each run as stopped.
++		const methods = new Proxy(
++			{},
++			{
++				get: () => () => {},
++				has: (_target, key) => key !== "escapeStops",
++			},
++		);
++		class NativeSession {}
++		Object.setPrototypeOf(NativeSession.prototype, methods);
++		class Current extends NativeSession {
++			get escapeStops() {
++				return 0;
++			}
++		}
+ 		expect<unknown>(adaptDesktopSession(Current)).toBe(Current);
+-		const Stale = adaptDesktopSession({ prototype: prototype(false) });
+-		expect(() => new Stale({ display: "active" })).toThrow(/^Unsupported: .*\(missing escapeStops\)/);
++		class Stale extends NativeSession {}
++		expect(() => new (adaptDesktopSession(Stale))({ display: "active" })).toThrow(
++			/^Unsupported: .*\(missing escapeStops\)/,
++		);
+ 	});
+ });
+ 
+diff --git a/packages/natives/test/desktop.test.ts b/packages/natives/test/desktop.test.ts
+index b41b7c24c5..b17ab87174 100644
+--- a/packages/natives/test/desktop.test.ts
++++ b/packages/natives/test/desktop.test.ts
+@@ -1,10 +1,8 @@
+ import { describe, expect, it } from "bun:test";
+-import { createDesktopSession } from "../native/desktop.js";
+-import { DesktopSession } from "../native/index.js";
++import { DesktopSession, visibleWidth } from "@oh-my-pi/pi-natives";
++import { createDesktopSession } from "@oh-my-pi/pi-natives/desktop";
+ 
+ const ERROR_CODE_PREFIX = /^([A-Z][A-Za-z]+): /;
+-const PERMISSION_STATES = ["granted", "denied", "unknown", "unavailable", "prompt-or-granted"];
+-const BACKENDS = ["quartz", "x11", "wayland", "win32", "unavailable"];
+ 
+ async function expectRejectionCode(operation: () => Promise<unknown>, acceptedCodes: readonly string[]): Promise<void> {
+ 	const fulfilled = Symbol("fulfilled");
+@@ -32,43 +30,30 @@ async function expectRejectionCode(operation: () => Promise<unknown>, acceptedCo
+ }
+ 
+ describe("DesktopSession", () => {
+-	it("constructs through the factory and reports the complete capability shape", async () => {
+-		const session = createDesktopSession({ display: "all" });
+-		try {
+-			expect(session).toBeInstanceOf(DesktopSession);
+-
+-			const capabilities = session.capabilities;
+-			expect(BACKENDS).toContain(capabilities.backend);
+-			// displayServer is optional (`displayServer?: string`): napi omits the
+-			// key entirely when the backend reports None (headless CI).
+-			expect(["string", "undefined"]).toContain(typeof capabilities.displayServer);
+-			expect(typeof capabilities.capture).toBe("boolean");
+-			expect(typeof capabilities.input).toBe("boolean");
+-			expect(typeof capabilities.ax).toBe("boolean");
+-			expect(typeof capabilities.backgroundWindowInput).toBe("boolean");
+-			expect(typeof capabilities.takeover).toBe("boolean");
+-			expect(PERMISSION_STATES).toContain(capabilities.capturePermission);
+-			expect(PERMISSION_STATES).toContain(capabilities.inputPermission);
+-			expect(PERMISSION_STATES).toContain(capabilities.axPermission);
+-			expect(typeof capabilities.displayCount).toBe("number");
+-		} finally {
+-			await session.close();
+-		}
++	it.skipIf(process.platform !== "android")("imports safely and rejects the unsupported factory on Android", () => {
++		expect(DesktopSession).toBeUndefined();
++		expect(visibleWidth("native", 3)).toBe(6);
++		expect(() => createDesktopSession({ display: "all" })).toThrow(
++			"Unsupported: desktop sessions are not supported on this platform.",
++		);
+ 	});
+ 
+-	it("rejects a nonexistent capture target with a documented native code", async () => {
+-		const session = new DesktopSession({ display: "all" });
+-		try {
+-			await expectRejectionCode(
+-				() => session.capture("no-such-window-id-999999"),
+-				["WindowNotFound", "InvalidTarget", "CaptureFailed", "PermissionDenied"],
+-			);
+-		} finally {
+-			await session.close();
+-		}
+-	});
++	it.skipIf(process.platform === "android")(
++		"rejects a nonexistent capture target with a documented native code",
++		async () => {
++			const session = new DesktopSession({ display: "all" });
++			try {
++				await expectRejectionCode(
++					() => session.capture("no-such-window-id-999999"),
++					["WindowNotFound", "InvalidTarget", "CaptureFailed", "PermissionDenied"],
++				);
++			} finally {
++				await session.close();
++			}
++		},
++	);
+ 
+-	it("rejects coordinate input before capture", async () => {
++	it.skipIf(process.platform === "android")("rejects coordinate input before capture", async () => {
+ 		const session = new DesktopSession({ display: "all" });
+ 		try {
+ 			await expectRejectionCode(
+@@ -80,13 +65,13 @@ describe("DesktopSession", () => {
+ 		}
+ 	});
+ 
+-	it("closes idempotently", async () => {
++	it.skipIf(process.platform === "android")("closes idempotently", async () => {
+ 		const session = new DesktopSession({ display: "all" });
+ 		await session.close();
+ 		await session.close();
+ 	});
+ 
+-	it("rejects calls after close with Closed", async () => {
++	it.skipIf(process.platform === "android")("rejects calls after close with Closed", async () => {
+ 		const session = new DesktopSession({ display: "all" });
+ 		await session.close();
+ 
+diff --git a/packages/natives/test/embed-native.test.ts b/packages/natives/test/embed-native.test.ts
+index 302cd60ae6..6ffae26e83 100644
+--- a/packages/natives/test/embed-native.test.ts
++++ b/packages/natives/test/embed-native.test.ts
+@@ -4,7 +4,7 @@ import * as os from "node:os";
+ import * as path from "node:path";
+ import { embeddedAddonFiles } from "../scripts/embed-native";
+ import packageJson from "../package.json" with { type: "json" };
+-import { type EmbeddedAddon, embeddedAddonPath, extractEmbeddedAddons } from "../native/loader-state.js";
++import { type EmbeddedAddon, embeddedAddonPath } from "../native/loader-state.js";
+ 
+ describe("native addon embedding", () => {
+ 	for (const [label, contents] of [
+@@ -48,38 +48,78 @@ describe("native addon embedding", () => {
+ 		}
+ 	});
+ 
+-	it("emits a manifest whose zstd frames the loader extracts back to the addon", async () => {
+-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-embed-"));
++	it("extracts the Android ARM64 addon from a standalone executable", async () => {
++		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi natives embed-"));
+ 		const nativeDir = path.join(root, "native");
+-		const outDir = path.join(root, "out");
+ 		const cacheDir = path.join(root, "cache");
+-		// A pre-stamp addon whose legacy sentinel matches the version (the loader accepts it).
++		const executablePath = path.join(root, "native-embed-smoke");
+ 		const addon = "binary__piNativesV18_1_1\0";
+ 		try {
+-			await Bun.write(path.join(nativeDir, "pi_natives.win32-arm64.node"), addon);
+-			await fs.mkdir(cacheDir);
+-			const files = await embeddedAddonFiles({ platform: "win32", arch: "arm64", nativeDir, version: "18.1.1" });
+-			for (const filePath in files) {
+-				await Bun.write(path.join(outDir, path.basename(filePath)), files[filePath]);
++			await Promise.all([fs.mkdir(nativeDir), fs.mkdir(cacheDir)]);
++			await Bun.write(path.join(nativeDir, "pi_natives.android-arm64.node"), addon);
++			const embeddedFiles = await embeddedAddonFiles({
++				platform: "android",
++				arch: "arm64",
++				nativeDir,
++				version: "18.1.1",
++			});
++			for (const [filePath, contents] of Object.entries(embeddedFiles)) {
++				await Bun.write(filePath, contents);
+ 			}
+ 
+-			// Dynamic: the manifest under test is generated into a per-test temp dir.
+-			const { embeddedAddon }: { embeddedAddon: EmbeddedAddon } = await import(
+-				path.join(outDir, "embedded-addon.js")
++			const runner = path.join(root, "run-compiled.ts");
++			await Bun.write(
++				runner,
++				[
++					`import { embeddedAddon } from ${JSON.stringify(path.join(nativeDir, "embedded-addon.js"))};`,
++					`import { extractEmbeddedAddons } from ${JSON.stringify(path.join(import.meta.dir, "../native/loader-state.js"))};`,
++					`const targetDir = process.env.EMBEDDED_TEST_CACHE_DIR;`,
++					`if (!targetDir) throw new Error("Missing embedded test cache directory");`,
++					`const [addonPath] = extractEmbeddedAddons({ files: embeddedAddon.files, targetDir });`,
++					`if (!addonPath) throw new Error("No embedded addon was extracted");`,
++					`process.stdout.write(JSON.stringify({ embeddedAddon, addonPath, addon: await Bun.file(addonPath).text() }));`,
++				].join("\n"),
+ 			);
+-			expect(embeddedAddon.platformTag).toBe("win32-arm64");
+-			expect(embeddedAddon.version).toBe("18.1.1");
+-			expect(embeddedAddon.files).toEqual([
++			const output = await Bun.build({
++				entrypoints: [runner],
++				target: "bun",
++				files: embeddedFiles,
++				compile: { outfile: executablePath },
++				throw: false,
++			});
++			if (!output.success) {
++				throw new Error(
++					`Standalone embedded addon build failed:\n${output.logs.map(log => log.message).join("\n")}`,
++				);
++			}
++
++			const result = Bun.spawnSync([executablePath], {
++				cwd: root,
++				env: { ...Bun.env, EMBEDDED_TEST_CACHE_DIR: cacheDir },
++				stdout: "pipe",
++				stderr: "pipe",
++			});
++			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
++			const loaded = JSON.parse(result.stdout.toString()) as {
++				embeddedAddon: EmbeddedAddon;
++				addonPath: string;
++				addon: string;
++			};
++			expect(loaded.embeddedAddon.platformTag).toBe("android-arm64");
++			expect(loaded.embeddedAddon.version).toBe("18.1.1");
++			expect(
++				loaded.embeddedAddon.files.map(({ variant, filename, size, hash }) => ({ variant, filename, size, hash })),
++			).toEqual([
+ 				{
+ 					variant: "default",
+-					filename: "pi_natives.win32-arm64.node",
++					filename: "pi_natives.android-arm64.node",
+ 					size: addon.length,
+ 					hash: Bun.hash.xxHash64(addon).toString(16).padStart(16, "0"),
+-					zstdPath: path.join(await fs.realpath(outDir), "pi_natives.win32-arm64.node.zst"),
+ 				},
+ 			]);
+-			const extracted = embeddedAddonPath(cacheDir, embeddedAddon.files[0]);
+-			expect(extractEmbeddedAddons({ files: embeddedAddon.files, targetDir: cacheDir })).toEqual([extracted]);
++			const extracted = embeddedAddonPath(cacheDir, loaded.embeddedAddon.files[0]);
++			expect(loaded.addonPath).toBe(extracted);
++			expect(loaded.addon).toBe(addon);
+ 			expect(await Bun.file(extracted).text()).toBe(addon);
+ 		} finally {
+ 			await fs.rm(root, { recursive: true, force: true });
+diff --git a/scripts/bazel-natives.ts b/scripts/bazel-natives.ts
+index 69497f453b..48b5bd4be3 100755
+--- a/scripts/bazel-natives.ts
++++ b/scripts/bazel-natives.ts
+@@ -1,17 +1,18 @@
+ #!/usr/bin/env bun
+ /**
+- * Canonical Bazel driver for the shipping pi_natives addons.
++ * Canonical Bazel driver for shipping pi_natives addons and the explicit Android ARM64 target.
+  *
+  * Usage: bun scripts/bazel-natives.ts <target>... [--dest <dir>] [--source <dir>] [-- <extra bazel args>]
+  *
+- * Targets are the //:natives-* names from BUILD.bazel (e.g. linux-x64-baseline,
+- * darwin-arm64) plus three pseudo-targets:
++ * Targets are the `//:natives-*` names from `BUILD.bazel` (e.g. linux-x64-baseline,
++ * darwin-arm64, or the experimental `android-arm64` cross-target) plus three pseudo-targets:
+  *   - host        the single addon matching this machine (x64 hosts pick
+  *                 modern vs baseline via AVX2 detection; a musl Bun gets the
+  *                 musl addon)
+  *   - all         every shipped addon (linux hosts cross-build all of them)
+  *   - darwin-all  both darwin addons
+  *
++ * The Android target is explicit-only and is deliberately absent from `all`.
+  * One `bazel build` covers all requested targets; outputs are located via
+  * `bazel cquery --output=files` (falling back to the bazel-bin path convention)
+  * and copied dereferenced into --dest (default packages/natives/native).
+@@ -24,7 +25,7 @@
+  * for plain host iteration. Bazel is opt-in for host via
+  * `OMP_NATIVE_BUILD_BACKEND=bazel` or by passing extra bazel args after `--`;
+  * explicit //:natives-* targets and aggregates always build through bazel.
+- * Release CI builds every addon through that path on Linux.
++ * Release CI builds every shipping addon through that path on Linux.
+  *
+  * Windows hosts: the msvc cc toolchain in bazel/toolchains/msvc only supports
+  * linux/mac exec hosts (its clang-cl+xwin wrappers replace the MSVC a Windows
+@@ -54,6 +55,7 @@ export const ADDON_OUTPUTS: Record<string, string> = {
+ 	"linux-x64-baseline": "pi_natives.linux-x64-baseline.node",
+ 	"linux-x64-modern": "pi_natives.linux-x64-modern.node",
+ 	"linux-arm64": "pi_natives.linux-arm64.node",
++	"android-arm64": "pi_natives.android-arm64.node",
+ 	"linux-musl-x64-baseline": "pi_natives.linux-x64-baseline.node",
+ 	"linux-musl-arm64": "pi_natives.linux-arm64.node",
+ 	"darwin-x64-baseline": "pi_natives.darwin-x64-baseline.node",
+@@ -89,9 +91,10 @@ export interface HostInfo {
+ /**
+  * The single addon target this host can load: modern iff x64 + AVX2, musl iff
+  * the running Bun is musl. There is no modern musl addon; the runtime loader
+- * falls back from modern to baseline.
++ * falls back from modern to baseline. Termux resolves to its Android ARM64 addon.
+  */
+ export function hostTargetName(host: HostInfo): string {
++	if (host.platform === "android" && host.arch === "arm64") return "android-arm64";
+ 	if (host.platform === "darwin") {
+ 		if (host.arch === "arm64") return "darwin-arm64";
+ 		if (host.arch === "x64") return "darwin-x64-baseline";
+@@ -138,6 +141,15 @@ export function resolveTargetMembers(names: string[], host: HostInfo): string[]
+ 	return members;
+ }
+ 
++/**
++ * Add the local Android NDK toolchain only when resolved members include Android.
++ */
++export function targetToolchainArgs(names: string[], host: HostInfo): string[] {
++	return resolveTargetMembers(names, host).includes("android-arm64")
++		? ["--extra_toolchains=@androidndk//:all"]
++		: [];
++}
++
+ /**
+  * Workspace-relative output paths by bazel-bin convention:
+  * bazel-bin/natives-<t>/<canonical>.node. Fallback when cquery is unavailable.
+@@ -156,6 +168,8 @@ export function conventionOutputPaths(names: string[], host: HostInfo): string[]
+  * that artifact on a glibc runner. Only the host's own target, which matches
+  * the running Bun's libc, is probed, and one invocation can never hold both
+  * spellings of a basename because the install loop refuses duplicates.
++ * Android uses a distinct target/triple from Linux even on ARM64, so a Linux
++ * builder never probes `android-arm64`.
+  */
+ export function hostProbeFilename(names: string[], host: HostInfo): string | null {
+ 	let hostTarget: string;
+@@ -282,7 +296,7 @@ async function installAddon(
+ 		await fs.rename(tempPath, destPath); // atomic even if dest is a loaded addon
+ 		return stamp;
+ 	} catch (err) {
+-		await fs.unlink(tempPath).catch(() => {});
++		await fs.unlink(tempPath).catch(() => { });
+ 		throw err;
+ 	}
+ }
+@@ -317,7 +331,7 @@ export async function verifyHostAddonLoads(
+ 		expectedVersion === undefined
+ 			? ""
+ 			: `const reported = typeof m.exports.__piNativesBuildVersion === "function" ? m.exports.__piNativesBuildVersion() : undefined; ` +
+-				`if (reported !== ${JSON.stringify(expectedVersion)}) { console.error("addon reports build version " + JSON.stringify(reported) + ", expected " + ${JSON.stringify(JSON.stringify(expectedVersion))}); process.exit(1); }`;
++			`if (reported !== ${JSON.stringify(expectedVersion)}) { console.error("addon reports build version " + JSON.stringify(reported) + ", expected " + ${JSON.stringify(JSON.stringify(expectedVersion))}); process.exit(1); }`;
+ 	const probe =
+ 		`const m = { exports: {} }; try { process.dlopen(m, ${JSON.stringify(destPath)}); } ` +
+ 		"catch (error) { console.error(error && error.message ? error.message : String(error)); process.exit(1); } " +
+@@ -513,8 +527,8 @@ async function main(): Promise<void> {
+ 			if (host.platform === "win32") {
+ 				throw new Error(
+ 					`Cannot bazel-build [${options.targets.join(", ")}] on a Windows host: the msvc cross ` +
+-						"toolchain (bazel/toolchains/msvc) only runs on linux/mac exec hosts. Use `host` here " +
+-						"(local napi build via VS Build Tools), or run this script from WSL/linux for cross targets.",
++					"toolchain (bazel/toolchains/msvc) only runs on linux/mac exec hosts. Use `host` here " +
++					"(local napi build via VS Build Tools), or run this script from WSL/linux for cross targets.",
+ 				);
+ 			}
+ 			throw new Error("OMP_NATIVE_BUILD_BACKEND=cargo supports only the host target");
+@@ -536,7 +550,7 @@ async function main(): Promise<void> {
+ 			if (options.targets.length !== 1 || options.targets[0] !== "host") {
+ 				throw new Error(
+ 					`Neither \`bazelisk\` nor \`bazel\` found on PATH; Cargo fallback supports only the host target, not [${options.targets.join(", ")}]. ` +
+-						"Install bazelisk or request `host` for a local Cargo/N-API build.",
++					"Install bazelisk or request `host` for a local Cargo/N-API build.",
+ 				);
+ 			}
+ 			console.log("bazelisk/bazel not found; falling back to the local Cargo/N-API host build");
+@@ -547,8 +561,16 @@ async function main(): Promise<void> {
+ 		// endpoint composition stays in .github/actions/bazel-cache.
+ 		const rcPath = Bun.env.OMP_BAZEL_RC?.trim();
+ 		const startupArgs = rcPath ? [`--bazelrc=${rcPath}`] : [];
+-
+-		const buildArgs = [...startupArgs, "build", ...options.bazelArgs, "--", ...labels];
++		const toolchainArgs = targetToolchainArgs(options.targets, host);
++
++		const buildArgs = [
++			...startupArgs,
++			"build",
++			...options.bazelArgs,
++			...toolchainArgs,
++			"--",
++			...labels,
++		];
+ 		console.log(`$ ${path.basename(bazel)} ${buildArgs.join(" ")}`);
+ 		const build = await runBazel(bazel, buildArgs, "inherit");
+ 		if (build.exitCode !== 0) {
+@@ -561,7 +583,14 @@ async function main(): Promise<void> {
+ 		// into a single union rather than positional args.
+ 		const cquery = await runBazel(
+ 			bazel,
+-			[...startupArgs, "cquery", ...options.bazelArgs, "--output=files", labels.join(" + ")],
++			[
++				...startupArgs,
++				"cquery",
++				...options.bazelArgs,
++				...toolchainArgs,
++				"--output=files",
++				labels.join(" + "),
++			],
+ 			"pipe",
+ 		);
+ 		if (cquery.exitCode === 0) {
+@@ -585,7 +614,7 @@ async function main(): Promise<void> {
+ 			// installing both into one dest would silently clobber.
+ 			console.error(
+ 				`refusing to install ${output}: ${base} already provided by ${prior}. ` +
+-					"Build gnu and musl targets in separate invocations with separate --dest dirs.",
++				"Build gnu and musl targets in separate invocations with separate --dest dirs.",
+ 			);
+ 			process.exit(1);
+ 		}
+@@ -603,7 +632,9 @@ async function main(): Promise<void> {
+ 				? `installed ${path.basename(output)} (stamped ${version}) → ${destPath}`
+ 				: `installed ${path.basename(output)} (prebuilt without a version stamp slot; left unstamped) → ${destPath}`,
+ 		);
+-		if (!options.source) await verifyLinuxAddon(destPath);
++		if (!options.source && path.basename(output).startsWith("pi_natives.linux-")) {
++			await verifyLinuxAddon(destPath);
++		}
+ 		if (probeFilename && path.basename(output) === probeFilename) {
+ 			await verifyHostAddonLoads(destPath, undefined, stamped ? version : undefined);
+ 		}
+diff --git a/scripts/ci-build-upload.ts b/scripts/ci-build-upload.ts
+index 7cef2dab8f..e053872e37 100755
+--- a/scripts/ci-build-upload.ts
++++ b/scripts/ci-build-upload.ts
+@@ -6,7 +6,7 @@
+ // `canary`, everything else with channel `stable`.
+ //
+ // Usage:
+-//   bun scripts/ci-build-upload.ts <tag> <file>...    # all 8 release binaries
++//   bun scripts/ci-build-upload.ts <tag> <file>...    # all 9 release binaries
+ // The viewer is read from packages/coding-agent/export-assets and must exactly
+ // match src/export/html/viewer.generated.json before any network request.
+ //
+@@ -45,6 +45,7 @@ const ASSETS: Readonly<Record<string, { platform: string; arch: string }>> = {
+ 	"omp-darwin-x64": { platform: "macos", arch: "x86_64" },
+ 	"omp-linux-x64": { platform: "linux", arch: "x86_64" },
+ 	"omp-linux-arm64": { platform: "linux", arch: "arm64" },
++	"omp-android-arm64": { platform: "android", arch: "arm64" },
+ 	"omp-linux-musl-x64": { platform: "linux-musl", arch: "x86_64" },
+ 	"omp-linux-musl-arm64": { platform: "linux-musl", arch: "arm64" },
+ 	"omp-windows-x64.exe": { platform: "windows", arch: "x86_64" },
+diff --git a/scripts/ci-release-build-binaries.ts b/scripts/ci-release-build-binaries.ts
+index 922bf9c530..69db2d7586 100644
+--- a/scripts/ci-release-build-binaries.ts
++++ b/scripts/ci-release-build-binaries.ts
+@@ -2,13 +2,18 @@
+ 
+ import * as fs from "node:fs/promises";
+ import * as path from "node:path";
+-import { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
++import {
++	ANDROID_COMPILE_TARGET,
++	COMPILED_EXTERNAL_DEPENDENCIES,
++	compileCodingAgent,
++	type CodingAgentCompileTarget,
++} from "../packages/coding-agent/scripts/compile-binary";
+ 
+ interface BinaryTarget {
+ 	id: string;
+ 	platform: string;
+ 	arch: string;
+-	target: Bun.Build.CompileTarget;
++	target: CodingAgentCompileTarget;
+ 	outfile: string;
+ }
+ 
+@@ -46,6 +51,13 @@ const targets: BinaryTarget[] = [
+ 		target: "bun-linux-arm64",
+ 		outfile: "packages/coding-agent/binaries/omp-linux-arm64",
+ 	},
++	{
++		id: "android-arm64",
++		platform: "android",
++		arch: "arm64",
++		target: ANDROID_COMPILE_TARGET,
++		outfile: "packages/coding-agent/binaries/omp-android-arm64",
++	},
+ 	{
+ 		id: "linux-musl-x64",
+ 		platform: "linux",
+diff --git a/scripts/install.sh b/scripts/install.sh
+index 7eebd9a3d5..2870590203 100755
+--- a/scripts/install.sh
++++ b/scripts/install.sh
+@@ -105,6 +105,12 @@ host_arch() {
+     esac
+ }
+ 
++# Termux exports TERMUX_VERSION; Android's toybox also identifies itself via
++# `uname -o` even though `uname -s` reports Linux.
++is_android() {
++    [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ]
++}
++
+ # Bun's own architecture (x64|arm64), or empty when it can't be determined.
+ bun_arch() {
+     bun -e 'process.stdout.write(process.arch)' 2>/dev/null
+@@ -260,26 +266,35 @@ install_binary() {
+         exit 1
+     fi
+ 
+-    # Detect platform
+-    OS="$(uname -s)"
+-    ARCH="$(host_arch)"
++    # Android uses Bionic, not Linux glibc or musl. Detect it before libc
++    # classification so a Termux host never receives a Linux executable.
++    if [ "$ANDROID_HOST" -eq 1 ]; then
++        ARCH="$(host_arch)"
++        PLATFORM="android"
++        TARGET_ARCH="arm64"
++        EXPECTED_BINARY="omp-android-arm64"
++    else
++        OS="$(uname -s)"
++        ARCH="$(host_arch)"
+ 
+-    case "$OS" in
+-        Linux)  PLATFORM="linux" ;;
+-        Darwin) PLATFORM="macos" ;;
+-        *)      echo "Unsupported OS: $OS"; exit 1 ;;
+-    esac
++        case "$OS" in
++            Linux)  PLATFORM="linux" ;;
++            Darwin) PLATFORM="macos" ;;
++            *)      echo "Unsupported OS: $OS"; exit 1 ;;
++        esac
+ 
+-    case "$ARCH" in
+-        x64)   TARGET_ARCH="x86_64" ;;
+-        arm64) TARGET_ARCH="arm64" ;;
+-        *)     echo "Unsupported architecture: $ARCH"; exit 1 ;;
+-    esac
++        case "$ARCH" in
++            x64)   TARGET_ARCH="x86_64" ;;
++            arm64) TARGET_ARCH="arm64" ;;
++            *)     echo "Unsupported architecture: $ARCH"; exit 1 ;;
++        esac
+ 
+-    if [ "$PLATFORM" = "linux" ]; then
+-        if [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
+-            PLATFORM="linux-musl"
++        if [ "$PLATFORM" = "linux" ]; then
++            if [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
++                PLATFORM="linux-musl"
++            fi
+         fi
++
+     fi
+ 
+     TARGET="${PLATFORM}-${TARGET_ARCH}"
+@@ -305,6 +320,7 @@ install_binary() {
+     FILE_JSON=$(printf '%s\n' "$BUILD_JSON" | json_file_object)
+     BINARY=$(printf '%s\n' "$FILE_JSON" | json_string name)
+     EXPECTED_SHA256=$(printf '%s\n' "$FILE_JSON" | json_string sha256)
++
+     # Go's JSON encoder writes `&` in the presigned URL as \u0026.
+     DOWNLOAD_URL=$(printf '%s\n' "$BUILD_JSON" | json_string download | sed 's/\\u0026/\&/g')
+     if [ -z "$VERSION" ] || [ -z "$BINARY" ] || [ -z "$DOWNLOAD_URL" ] ||
+@@ -312,6 +328,11 @@ install_binary() {
+         echo "Unexpected answer from ${API_URL}"
+         exit 1
+     fi
++
++    if [ "$ANDROID_HOST" -eq 1 ] && [ "$BINARY" != "$EXPECTED_BINARY" ]; then
++        echo "Unexpected artifact for ${TARGET}: expected ${EXPECTED_BINARY}, got ${BINARY}"
++        exit 1
++    fi
+     echo "Using version: $VERSION"
+ 
+     mkdir -p "$INSTALL_DIR"
+@@ -457,10 +478,24 @@ print_path_hint() {
+     printf '  %s\n\n' "$path_cmd"
+     echo "Then run 'omp' to get started!"
+ }
++ANDROID_HOST=0
++if is_android; then
++    ANDROID_HOST=1
++    ANDROID_ARCH="$(host_arch)"
++    if [ "$ANDROID_ARCH" != "arm64" ]; then
++        echo "Unsupported Android architecture: $ANDROID_ARCH (only arm64 is supported)"
++        exit 1
++    fi
++fi
+ 
+ # Main logic
+ case "$MODE" in
+     source)
++        if [ "$ANDROID_HOST" -eq 1 ]; then
++            echo "Source installs are not supported on Android/Termux."
++            echo "Install the native Android binary with --binary instead."
++            exit 1
++        fi
+         if ! has_bun; then
+             install_bun
+         fi
