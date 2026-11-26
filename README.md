@@ -1,20 +1,56 @@
-# oh-my-pi Termux/Android arm64
+# oh-my-pi Termux Patch
 
-GitHub Actions 手动触发（`workflow_dispatch`）：可选输入为 `upstream_repo`（`owner/repo` 或 GitHub URL）、`upstream_ref`、`android_platform`、`src_dir`、`out_dir`；补丁路径与目标 triple 是产品常量，不可覆盖；仅产出 `pi_natives.android-arm64.node` 作为 Actions artifact。
-工作流固定 Android NDK r30、API 24 与 16 KiB 对齐。
+![oh-my-pi Termux 补丁：仅用于 Termux/Android arm64](assets/header.svg)
 
-本地 Termux 构建：
+本仓库提供在原生 Termux / Android arm64 / Bionic libc 上安装 `@oh-my-pi/pi-coding-agent`（omp）的补丁和脚本。
+
+仅限原生 Termux / Android arm64 / Bionic libc；不用于 Linux glibc、macOS、Windows、proot 或跨 ABI 复用。
+
+## 产物
+
+本仓库不提交二进制；从 GitHub Actions artifact 下载 `pi_natives.android-arm64.node`，或本地构建。
+`native/` 中的 JS 适配层随仓库提供，由 `patch.sh` 安装。
+
+## 安装
+
+安装前先备份：如有 `~/backup-omp-native.sh` 就运行它，否则保留此前的备份文件。
+
+用 Bun 安装与 addon 匹配的 CLI，下载 Actions 产物后执行：
+
+```bash
+bun add -g @oh-my-pi/pi-coding-agent@19.2.1
+# 下载 pi_natives.android-arm64.node 后：
+./patch.sh /path/to/pi_natives.android-arm64.node
+```
+
+CLI、natives 包与 addon 版本戳必须一致。`patch.sh` 是仓库根目录脚本，只安装，不构建。
+
+## 本地构建
 
 ```bash
 ./build.sh
 ```
 
-可选覆盖：`UPSTREAM_REPO`、`UPSTREAM_REF`、`SRC`、`NAPI`、`OUT`（例如 `SRC=/path/to/source ./build.sh`）。
+可选环境变量覆盖：`UPSTREAM_REPO`、`UPSTREAM_REF`、`SRC`、`NAPI`、`OUT`。脚本结束会打印产物绝对路径。
 
-安装下载的 addon：
+## GitHub Actions
 
-```bash
-./patch.sh /path/to/pi_natives.android-arm64.node
-```
+手动触发 `workflow_dispatch`。可选输入：
 
-仓库开发指引见 [AGENTS.md](AGENTS.md)。
+| 输入 | 默认值 |
+| --- | --- |
+| `upstream_repo` | `can1357/oh-my-pi` |
+| `upstream_ref` | `v19.2.1` |
+| `android_platform` | `android-24` |
+| `src_dir` | `src` |
+| `out_dir` | `src/packages/natives/native/android-build` |
+
+补丁路径与目标 triple 是常量，不可覆盖。工作流固定 Android NDK r30、API 24、16 KiB 对齐；仅上传 `.node` 产物 `pi_natives.android-arm64.node`。
+
+## 回滚
+
+如有 `~/rollback-omp-native.sh`，运行它恢复完整 native 文件集；否则手动还原此前的备份文件。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。
