@@ -13,8 +13,6 @@
 
 ## 安装
 
-安装前先备份：如有 `~/backup-omp-native.sh` 就运行它，否则保留此前的备份文件。
-
 用 Bun 安装与 addon 匹配的 CLI，下载 Actions 产物后执行：
 
 ```bash
@@ -46,10 +44,6 @@ CLI、natives 包与 addon 版本戳必须一致。`patch.sh` 是仓库根目录
 | `out_dir` | `src/packages/natives/native/android-build` |
 
 补丁路径与目标 triple 是常量，不可覆盖。工作流固定 Android NDK r30、API 24、16 KiB 对齐；仅上传 `.node` 产物 `pi_natives.android-arm64.node`。
-
-## 回滚
-
-如有 `~/rollback-omp-native.sh`，运行它恢复完整 native 文件集；否则手动还原此前的备份文件。
 
 ## License
 

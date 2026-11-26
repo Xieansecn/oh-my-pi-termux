@@ -4,7 +4,7 @@
 
 ## 文档边界
 
-- `README.md` 只放用户可见内容：产物、安装、本地构建、GitHub Actions、回滚、License。
+- `README.md` 只放用户可见内容：产物、安装、本地构建、GitHub Actions、License。
 - 开发约定、平台守卫、脚本边界只写在这里，不在 README 重复安装或实现叙述。
 
 ## 默认值与覆盖
