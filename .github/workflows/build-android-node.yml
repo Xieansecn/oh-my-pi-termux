@@ -25,13 +25,36 @@ jobs:
           ref: ${{ inputs.upstream_ref }}
           path: src
       - name: Apply Android patch
-        run: git -C src apply patches/android-bionic-build-v19.2.1.patch
+        run: git -C src apply "$GITHUB_WORKSPACE/patches/android-bionic-build-v19.2.1.patch"
       - name: Verify patch
         run: git -C src diff --check
+      - name: Preflight toolchain
+        run: |
+          set -eu
+          for tool in bun rustc llvm-strip cmake ninja; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "::error::missing required tool: $tool" >&2; exit 1; }
+          done
+          NAPI="$HOME/.cache/omp-android/tools/node_modules/.bin/napi"
+          [ -x "$NAPI" ] || { echo "::error::missing executable: $NAPI" >&2; exit 1; }
       - name: Build addon
         run: SRC=$GITHUB_WORKSPACE/src bash scripts/omp-android-build.sh
+      - name: Build provenance
+        run: |
+          set -euo pipefail
+          ADDON=src/packages/natives/native/android-build/pi_natives.android-arm64.node
+          ADDON_SHA256=$(sha256sum "$ADDON" | awk '{print $1}')
+          UPSTREAM_COMMIT=$(git -C src rev-parse HEAD)
+          PATCH_BLOB_SHA=$(git hash-object patches/android-bionic-build-v19.2.1.patch)
+          EFFECTIVE_VERSION=$(bun -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version)' src/packages/natives/package.json)
+          {
+            echo "addon_sha256=$ADDON_SHA256"
+            echo "upstream_commit=$UPSTREAM_COMMIT"
+            echo "patch_blob_sha=$PATCH_BLOB_SHA"
+            echo "effective_version=$EFFECTIVE_VERSION"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Upload addon
         uses: actions/upload-artifact@v4
         with:
           name: pi_natives.android-arm64.node
           path: src/packages/natives/native/android-build/pi_natives.android-arm64.node
+          if-no-files-found: error
