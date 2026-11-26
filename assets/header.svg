@@ -2,12 +2,61 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="oh-my-pi Termux Patch">
   <title>oh-my-pi Termux Patch</title>
   <desc>Native Android arm64 · Bionic libc · Bun. For Termux only — not Linux/macOS/Windows/proot.</desc>
-  <rect width="1200" height="300" rx="24" fill="#f6f8fa" stroke="#d0d7de" stroke-width="2"/>
-  <rect x="40" y="44" width="12" height="212" rx="6" fill="#0969da"/>
-  <rect x="64" y="44" width="8" height="212" rx="4" fill="#1a7f37"/>
-  <rect x="986" y="62" width="168" height="176" rx="20" fill="#eaeef2"/>
-  <path d="M1034 108h72M1034 136h72M1034 164h48" fill="none" stroke="#8c959f" stroke-width="10" stroke-linecap="round"/>
-  <text x="112" y="128" fill="#1f2328" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="60" font-weight="700">oh-my-pi Termux Patch</text>
-  <text x="114" y="188" fill="#0969da" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="30" font-weight="600">Native Android arm64 · Bionic libc · Bun</text>
-  <text x="114" y="240" fill="#57606a" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="21">For Termux only — not Linux/macOS/Windows/proot</text>
+  <defs>
+    <clipPath id="card"><rect width="1200" height="300" rx="24"/></clipPath>
+    <pattern id="checker" width="2" height="2" patternUnits="userSpaceOnUse">
+      <rect width="1" height="1" fill="#ffffff" fill-opacity=".03"/>
+      <rect x="1" y="1" width="1" height="1" fill="#ffffff" fill-opacity=".03"/>
+    </pattern>
+    <pattern id="scan" width="4" height="3" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#000000" fill-opacity=".4"/>
+    </pattern>
+    <pattern id="speckle" width="9" height="9" patternUnits="userSpaceOnUse">
+      <circle cx="1.1" cy="1.4" r=".6" fill="#fafafc" fill-opacity=".32"/>
+      <circle cx="6.2" cy="4.7" r=".45" fill="#fafafc" fill-opacity=".22"/>
+      <circle cx="3.4" cy="7.7" r=".35" fill="#fafafc" fill-opacity=".18"/>
+    </pattern>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f84fcc"/>
+      <stop offset=".5" stop-color="#9362f4"/>
+      <stop offset="1" stop-color="#00dbe4"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f84fcc"/>
+      <stop offset=".52" stop-color="#9362f4"/>
+      <stop offset="1" stop-color="#00dbe4"/>
+    </linearGradient>
+    <linearGradient id="arc" gradientUnits="userSpaceOnUse" x1="820" y1="300" x2="1200" y2="40">
+      <stop offset="0" stop-color="#460f55"/>
+      <stop offset=".45" stop-color="#f84fcc"/>
+      <stop offset=".78" stop-color="#9362f4"/>
+      <stop offset="1" stop-color="#00dbe4"/>
+    </linearGradient>
+    <radialGradient id="halo" cx=".16" cy=".5" r=".34">
+      <stop offset="0" stop-color="#f84fcc" stop-opacity=".18"/>
+      <stop offset=".55" stop-color="#9362f4" stop-opacity=".07"/>
+      <stop offset="1" stop-color="#9362f4" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <g clip-path="url(#card)">
+    <rect width="1200" height="300" fill="#09090b"/>
+    <rect width="1200" height="300" fill="url(#checker)"/>
+    <rect width="1200" height="300" fill="url(#halo)"/>
+    <path d="M820 300C930 252 1046 140 1200 42L1200 300Z" fill="none" stroke="#00dbe4" stroke-opacity=".18" stroke-width="18"/>
+    <path d="M820 300C930 252 1046 140 1200 42L1200 300Z" fill="url(#arc)"/>
+    <path d="M820 300C930 252 1046 140 1200 42L1200 300Z" fill="url(#speckle)" fill-opacity=".72"/>
+    <path d="M820 300C930 252 1046 140 1200 42L1200 300Z" fill="url(#scan)" fill-opacity=".35"/>
+    <path d="M820 300C930 252 1046 140 1200 42" fill="none" stroke="#00dbe4" stroke-width="3"/>
+    <g transform="translate(56 70)">
+      <rect width="160" height="160" rx="30" fill="#0f0a14" stroke="#ffffff" stroke-opacity=".12"/>
+      <g transform="scale(2.5)">
+        <path fill="url(#mark)" d="M10 14h45v9h-9v33h-9V23h-9v22h-9V23h-9z"/>
+      </g>
+    </g>
+    <rect x="260" y="82" width="62" height="4" rx="2" fill="url(#accent)"/>
+    <text x="260" y="143" fill="#f5f5f5" font-family="Geist, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="58" font-weight="600" letter-spacing="-1.8">oh-my-pi <tspan fill="#f84fcc">Termux Patch</tspan></text>
+    <text x="262" y="193" fill="#00dbe4" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="25" font-weight="500" letter-spacing="-.5">Native Android arm64 · Bionic libc · Bun</text>
+    <text x="264" y="237" fill="#c3c4c7" fill-opacity=".78" font-family="Geist, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="19" font-weight="400">For Termux only — not Linux/macOS/Windows/proot</text>
+  </g>
+  <rect x=".5" y=".5" width="1199" height="299" rx="23.5" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
 </svg>
