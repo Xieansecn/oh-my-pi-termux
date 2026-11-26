@@ -3,58 +3,250 @@ name: build android-arm64 node
 on:
   workflow_dispatch:
     inputs:
+      upstream_repo:
+        description: Upstream oh-my-pi repository URL
+        required: false
+        default: https://github.com/can1357/oh-my-pi.git
+        type: string
       upstream_ref:
         description: Upstream oh-my-pi ref to build
         required: false
         default: v19.2.1
         type: string
+      android_platform:
+        description: Android platform (e.g. android-24)
+        required: false
+        default: android-24
+        type: string
+      src_dir:
+        description: Workspace-relative path for the upstream checkout
+        required: false
+        default: src
+        type: string
+      out_dir:
+        description: Workspace-relative path for the build output
+        required: false
+        default: src/packages/natives/native/android-build
+        type: string
 
 permissions:
   contents: read
 
+env:
+  # NDK r30 LTS is pinned for reproducible cross builds.
+  ANDROID_NDK_VERSION: 30.0.16248370
+  TARGET_TRIPLE: aarch64-linux-android
+  PATCH_FILE: patches/android-bionic-build-v19.2.1.patch
+  RUSTUP_TOOLCHAIN: 1.100.0
+  ANDROID_STL: c++_static
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  PCRE2_SYS_STATIC: "1"
+  RUSTC_BOOTSTRAP: "1"
+  # Android 15+/16 KiB pages require 16 KiB ELF alignment.
+  RUSTFLAGS: -C target-cpu=generic -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384
+  CARGO_BUILD_JOBS: "2"
+
 jobs:
   build:
-    runs-on: [self-hosted, android, arm64, termux]
+    runs-on: ubuntu-24.04
     steps:
+      - name: Validate inputs
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          ANDROID_PLATFORM: ${{ inputs.android_platform }}
+          SRC_DIR: ${{ inputs.src_dir }}
+          OUT_DIR: ${{ inputs.out_dir }}
+        run: |
+          set -euo pipefail
+          for name in UPSTREAM_REPO UPSTREAM_REF PATCH_FILE TARGET_TRIPLE ANDROID_PLATFORM SRC_DIR OUT_DIR; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::$name is required"
+              exit 1
+            fi
+          done
+          case "$PATCH_FILE" in
+            /*) patch="$PATCH_FILE" ;;
+            *) patch="$GITHUB_WORKSPACE/$PATCH_FILE" ;;
+          esac
+          echo "PATCH_FILE_ABS=$patch" >> "$GITHUB_ENV"
+          case "$SRC_DIR" in
+            /*) ;;
+            *) SRC_DIR="$GITHUB_WORKSPACE/$SRC_DIR" ;;
+          esac
+          case "$OUT_DIR" in
+            /*) ;;
+            *) OUT_DIR="$GITHUB_WORKSPACE/$OUT_DIR" ;;
+          esac
+          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
+          echo "OUT=$OUT_DIR" >> "$GITHUB_ENV"
+          echo "ADDON=$OUT_DIR/pi_natives.android-arm64.node" >> "$GITHUB_ENV"
+
       - name: Checkout this repository
         uses: actions/checkout@v4
+
       - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
-          repository: can1357/oh-my-pi
+          repository: ${{ inputs.upstream_repo }}
           ref: ${{ inputs.upstream_ref }}
-          path: src
+          path: ${{ inputs.src_dir }}
+
       - name: Apply Android patch
-        run: git -C src apply "$GITHUB_WORKSPACE/patches/android-bionic-build-v19.2.1.patch"
-      - name: Verify patch
-        run: git -C src diff --check
-      - name: Preflight toolchain
-        run: |
-          set -eu
-          for tool in bun rustc llvm-strip cmake ninja; do
-            command -v "$tool" >/dev/null 2>&1 || { echo "::error::missing required tool: $tool" >&2; exit 1; }
-          done
-          NAPI="$HOME/.cache/omp-android/tools/node_modules/.bin/napi"
-          [ -x "$NAPI" ] || { echo "::error::missing executable: $NAPI" >&2; exit 1; }
-      - name: Build addon
-        run: SRC=$GITHUB_WORKSPACE/src bash scripts/omp-android-build.sh
-      - name: Build provenance
         run: |
           set -euo pipefail
-          ADDON=src/packages/natives/native/android-build/pi_natives.android-arm64.node
+          test -f "$PATCH_FILE_ABS"
+          git -C "$SRC_DIR" apply "$PATCH_FILE_ABS"
+
+      - name: Verify patch
+        run: git -C "$SRC_DIR" diff --check
+
+      - name: Setup Bun 1.4.5
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+
+      - name: Setup NAPI CLI 3.7.2
+        run: |
+          set -euo pipefail
+          bun add -g @napi-rs/cli@3.7.2
+          napi --version | grep -q '3.7.2'
+
+      - name: Setup Rust target
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET_TRIPLE"
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$TARGET_TRIPLE"
+          rustc --version
+
+      - name: Install and pin Android NDK
+        run: |
+          set -euo pipefail
+          : "${ANDROID_SDK_ROOT:?ANDROID_SDK_ROOT is required}"
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER" || { echo "::error::missing sdkmanager: $SDKMANAGER"; exit 1; }
+          NDK_DIR="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          PROPERTIES="$NDK_DIR/source.properties"
+          if ! grep -Fqx "Pkg.Revision = $ANDROID_NDK_VERSION" "$PROPERTIES" 2>/dev/null; then
+            printf 'y\n%.0s' {1..100} | "$SDKMANAGER" --licenses
+            "$SDKMANAGER" --install "ndk;$ANDROID_NDK_VERSION"
+          fi
+          grep -Fqx "Pkg.Revision = $ANDROID_NDK_VERSION" "$PROPERTIES" || { echo "::error::NDK $ANDROID_NDK_VERSION revision not found: $PROPERTIES"; exit 1; }
+          cat >> "$GITHUB_ENV" <<EOF
+          ANDROID_HOME=$ANDROID_SDK_ROOT
+          ANDROID_NDK=$NDK_DIR
+          ANDROID_NDK_HOME=$NDK_DIR
+          ANDROID_NDK_ROOT=$NDK_DIR
+          ANDROID_NDK_LATEST_HOME=$NDK_DIR
+          EOF
+
+      - name: Preflight Android NDK
+        env:
+          ANDROID_PLATFORM: ${{ inputs.android_platform }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_NDK_HOME:?ANDROID_NDK_HOME is required}"
+          : "${ANDROID_NDK_LATEST_HOME:?ANDROID_NDK_LATEST_HOME is required}"
+          if [[ "$ANDROID_NDK_HOME" != "$ANDROID_NDK_LATEST_HOME" ]]; then
+            echo "::error::ANDROID_NDK_HOME and ANDROID_NDK_LATEST_HOME must match"
+            exit 1
+          fi
+          PROPERTIES="$ANDROID_NDK_HOME/source.properties"
+          grep -Fqx "Pkg.Revision = $ANDROID_NDK_VERSION" "$PROPERTIES" || { echo "::error::NDK $ANDROID_NDK_VERSION revision not found: $PROPERTIES"; exit 1; }
+          if [[ ! "$ANDROID_PLATFORM" =~ ^android-([0-9]+)$ ]]; then
+            echo "::error::android_platform must be android-<numeric>"
+            exit 1
+          fi
+          API_LEVEL="${BASH_REMATCH[1]}"
+          API_LEVEL_NUM=$((10#$API_LEVEL))
+          if (( API_LEVEL_NUM < 21 || API_LEVEL_NUM > 37 )); then
+            echo "::error::android_platform API level must be in 21..37"
+            exit 1
+          fi
+          if (( API_LEVEL_NUM != 24 )); then
+            echo "::warning::android_platform is $ANDROID_PLATFORM, but NAPI 3.7.2 still forces API 24 for Cargo/TARGET_CC."
+          fi
+          NDK_LLVM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$NDK_LLVM/${TARGET_TRIPLE}${API_LEVEL}-clang"
+          CLANGXX="$NDK_LLVM/${TARGET_TRIPLE}${API_LEVEL}-clang++"
+          LLVM_AR="$NDK_LLVM/llvm-ar"
+          LLVM_STRIP="$NDK_LLVM/llvm-strip"
+          TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          for tool in "$CLANG" "$CLANGXX" "$LLVM_AR" "$LLVM_STRIP"; do
+            test -x "$tool" || { echo "::error::missing NDK tool: $tool"; exit 1; }
+          done
+          test -f "$TOOLCHAIN_FILE" || { echo "::error::missing CMake toolchain file: $TOOLCHAIN_FILE"; exit 1; }
+          TARGET_KEY="${TARGET_TRIPLE//-/_}"
+          CARGO_KEY="${TARGET_KEY^^}"
+          cat >> "$GITHUB_ENV" <<EOF
+          ANDROID_PLATFORM=$ANDROID_PLATFORM
+          ANDROID_NDK_HOME=$ANDROID_NDK_HOME
+          CC_${TARGET_KEY}=$CLANG
+          CXX_${TARGET_KEY}=$CLANGXX
+          AR_${TARGET_KEY}=$LLVM_AR
+          CARGO_TARGET_${CARGO_KEY}_LINKER=$CLANG
+          TARGET_CC=$CLANG
+          TARGET_CXX=$CLANGXX
+          TARGET_AR=$LLVM_AR
+          CMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE
+          EOF
+          echo "$NDK_LLVM" >> "$GITHUB_PATH"
+
+      - name: Build addon with NDK cross toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          cd "$SRC_DIR/crates/natives"
+          napi build \
+            --manifest-path Cargo.toml \
+            --package-json-path "$SRC_DIR/packages/natives/package.json" \
+            --target "$TARGET_TRIPLE" \
+            --platform \
+            --no-js \
+            --dts index.d.ts \
+            -o "$OUT" \
+            --profile local
+
+      - name: Strip, stamp and static checks
+        run: |
+          set -euo pipefail
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded "$ADDON"
+          bun "$SRC_DIR/scripts/stamp-native-version.ts" "$ADDON"
+          file "$ADDON"
+          file "$ADDON" | grep -q 'ELF .* shared object'
+          readelf -h "$ADDON" | grep -q 'ELF'
+          if [[ "$TARGET_TRIPLE" == aarch64-* ]]; then
+            file "$ADDON" | grep -q 'ARM aarch64'
+            readelf -h "$ADDON" | grep -q 'AArch64'
+          fi
+
+      - name: Build provenance
+        env:
+          ANDROID_PLATFORM: ${{ inputs.android_platform }}
+        run: |
+          set -euo pipefail
           ADDON_SHA256=$(sha256sum "$ADDON" | awk '{print $1}')
-          UPSTREAM_COMMIT=$(git -C src rev-parse HEAD)
-          PATCH_BLOB_SHA=$(git hash-object patches/android-bionic-build-v19.2.1.patch)
-          EFFECTIVE_VERSION=$(bun -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version)' src/packages/natives/package.json)
+          UPSTREAM_COMMIT=$(git -C "$SRC_DIR" rev-parse HEAD)
+          PATCH_BLOB_SHA=$(git hash-object "$PATCH_FILE_ABS")
+          EFFECTIVE_VERSION=$(bun -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version)' "$SRC_DIR/packages/natives/package.json")
+          RUSTC_VERSION=$(rustc --version)
+          NDK_VERSION=$(grep -m1 '^Pkg.Revision' "$ANDROID_NDK_HOME/source.properties" || true)
           {
             echo "addon_sha256=$ADDON_SHA256"
             echo "upstream_commit=$UPSTREAM_COMMIT"
             echo "patch_blob_sha=$PATCH_BLOB_SHA"
             echo "effective_version=$EFFECTIVE_VERSION"
+            echo "rustc=$RUSTC_VERSION"
+            echo "ndk_version=$ANDROID_NDK_VERSION"
+            echo "ndk=$ANDROID_NDK_HOME"
+            echo "ndk_revision=$NDK_VERSION"
+            echo "target=$TARGET_TRIPLE"
+            echo "android_platform=$ANDROID_PLATFORM"
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload addon
         uses: actions/upload-artifact@v4
         with:
           name: pi_natives.android-arm64.node
-          path: src/packages/natives/native/android-build/pi_natives.android-arm64.node
+          path: ${{ inputs.out_dir }}/pi_natives.android-arm64.node
           if-no-files-found: error
