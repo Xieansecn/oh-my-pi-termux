@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SRC="$HOME/tmp/omp-android-src"
+SRC="${SRC:-$HOME/tmp/omp-android-src}"
 ADDON="$SRC/packages/natives/native/android-build/pi_natives.android-arm64.node"
 OMP="$(readlink -f "$(command -v omp)")"
 N_INDEX="$(node -e 'const {createRequire}=require("node:module"); console.log(createRequire(process.argv[1]).resolve("@oh-my-pi/pi-natives"))' "$OMP")"

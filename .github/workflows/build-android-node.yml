@@ -1,0 +1,37 @@
+name: build android-arm64 node
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream oh-my-pi ref to build
+        required: false
+        default: v19.2.1
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, android, arm64, termux]
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: can1357/oh-my-pi
+          ref: ${{ inputs.upstream_ref }}
+          path: src
+      - name: Apply Android patch
+        run: git -C src apply patches/android-bionic-build-v19.2.1.patch
+      - name: Verify patch
+        run: git -C src diff --check
+      - name: Build addon
+        run: SRC=$GITHUB_WORKSPACE/src bash scripts/omp-android-build.sh
+      - name: Upload addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi_natives.android-arm64.node
+          path: src/packages/natives/native/android-build/pi_natives.android-arm64.node

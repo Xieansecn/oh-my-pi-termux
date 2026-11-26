@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SRC="$HOME/tmp/omp-android-src"
+SRC="${SRC:-$HOME/tmp/omp-android-src}"
 NAPI="$HOME/.cache/omp-android/tools/node_modules/.bin/napi"
 OUT="$SRC/packages/natives/native/android-build"
 ADDON="$OUT/pi_natives.android-arm64.node"
