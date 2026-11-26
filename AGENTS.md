@@ -35,6 +35,7 @@
 ## GitHub Actions
 
 - 使用 `workflow_dispatch` 手动触发；仅 `upstream_repo`、`upstream_ref`、`android_platform`、`src_dir`、`out_dir` 可覆盖。
+- `upstream_repo` 可写 `owner/repo` 或 GitHub URL；workflow 必须先归一化为 `owner/repo` 再传给 `actions/checkout`。
 - 补丁路径与目标 triple 是产品常量，不是 workflow 输入，也不允许覆盖。
 - 在 GitHub-hosted Linux 上通过 NDK 交叉编译；不调用 `build.sh`。
 - NDK revision 是产品常量，由 workflow 固定；SDK 使用 runner 自带的 cmdline-tools/sdkmanager。

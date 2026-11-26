@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       upstream_repo:
-        description: Upstream oh-my-pi repository URL
+        description: Upstream repository (owner/repo or GitHub URL)
         required: false
-        default: https://github.com/can1357/oh-my-pi.git
+        default: can1357/oh-my-pi
         type: string
       upstream_ref:
         description: Upstream oh-my-pi ref to build
@@ -82,13 +82,30 @@ jobs:
           echo "OUT=$OUT_DIR" >> "$GITHUB_ENV"
           echo "ADDON=$OUT_DIR/pi_natives.android-arm64.node" >> "$GITHUB_ENV"
 
+      - name: Normalize upstream repository
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        run: |
+          set -euo pipefail
+          repo="$UPSTREAM_REPO"
+          case "$repo" in
+            https://github.com/*) repo="${repo#https://github.com/}" ;;
+            http://github.com/*) repo="${repo#http://github.com/}" ;;
+            git@github.com:*) repo="${repo#git@github.com:}" ;;
+          esac
+          repo="${repo%.git}"
+          if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::upstream_repo must be owner/repo or a GitHub URL"
+            exit 1
+          fi
+          echo "UPSTREAM_REPO_SLUG=$repo" >> "$GITHUB_ENV"
       - name: Checkout this repository
         uses: actions/checkout@v4
 
       - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.upstream_repo }}
+          repository: ${{ env.UPSTREAM_REPO_SLUG }}
           ref: ${{ inputs.upstream_ref }}
           path: ${{ inputs.src_dir }}
 
